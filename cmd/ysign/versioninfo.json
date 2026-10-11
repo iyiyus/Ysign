@@ -2,13 +2,13 @@
   "FixedFileInfo": {
     "FileVersion": {
       "Major": 1,
-      "Minor": 1,
+      "Minor": 2,
       "Patch": 0,
       "Build": 0
     },
     "ProductVersion": {
       "Major": 1,
-      "Minor": 1,
+      "Minor": 2,
       "Patch": 0,
       "Build": 0
     },
@@ -22,14 +22,14 @@
     "Comments": "Fast cross-platform iOS code signing / re-signing tool (zsign-compatible). https://github.com/iyiyus/Ysign",
     "CompanyName": "Amias",
     "FileDescription": "ysign - fast cross-platform iOS code signing tool",
-    "FileVersion": "1.1.0",
+    "FileVersion": "1.2.0",
     "InternalName": "ysign",
     "LegalCopyright": "Copyright (c) 2026 Amias. Licensed under the MIT License.",
     "LegalTrademarks": "",
     "OriginalFilename": "ysign.exe",
     "PrivateBuild": "",
     "ProductName": "ysign",
-    "ProductVersion": "1.1.0",
+    "ProductVersion": "1.2.0",
     "SpecialBuild": ""
   },
   "VarFileInfo": {
