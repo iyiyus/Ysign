@@ -81,7 +81,7 @@ make test       # run tests
 make release    # cross-compile darwin + linux + windows
 ```
 
-> The repo ships GitHub Actions: `ci.yml` runs `go vet` + `go test` on every push; `release.yml` builds 5 platform binaries and publishes a GitHub Release when a `v*` tag is pushed.
+> The repo ships GitHub Actions: `ci.yml` runs `go vet` + `go test` on every push; `release.yml` builds 6 platform binaries and publishes a GitHub Release when a `v*` tag is pushed; `docker.yml` publishes multi-arch Docker images to GHCR.
 
 ### Cross-compile (no target platform needed)
 
@@ -95,6 +95,23 @@ GOOS=linux GOARCH=amd64 go build -o ysign-linux-amd64 ./cmd/ysign
 # Windows
 GOOS=windows GOARCH=amd64 go build -o ysign.exe ./cmd/ysign
 ```
+
+> The Windows executable embeds version info (product name, version, copyright), which reduces false positives from some antivirus products. When cutting a new release, update `cmd/ysign/versioninfo.json` and run `make resources` to regenerate it.
+
+### Docker (CI/CD)
+
+Images are published to the GitHub Container Registry for `linux/amd64` and `linux/arm64`:
+
+```bash
+# Pull
+docker pull ghcr.io/iyiyus/ysign:latest
+
+# Sign: mount the current directory into the container's /work
+docker run --rm -v "$PWD":/work ghcr.io/iyiyus/ysign \
+  -k cert.p12 -p PASSWORD -m dev.mobileprovision -o signed.ipa input.ipa
+```
+
+> The container's work directory is `/work`; pass the certificate, profile, and ipa in via a volume mount. Pushing a `v*` tag publishes `latest` plus the versioned image, while `main` publishes `edge`. You can also build locally with `make docker`.
 
 ### Minimal re-sign
 

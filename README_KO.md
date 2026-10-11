@@ -81,7 +81,7 @@ make test       # 테스트 실행
 make release    # darwin + linux + windows 크로스 컴파일
 ```
 
-> 저장소에 GitHub Actions가 포함되어 있습니다: `ci.yml`은 push 때마다 `go vet` + `go test`를 실행하고, `release.yml`은 `v*` 태그 push 시 5개 플랫폼 바이너리를 빌드해 GitHub Release를 발행합니다.
+> 저장소에 GitHub Actions가 포함되어 있습니다: `ci.yml`은 push 때마다 `go vet` + `go test`를 실행하고, `release.yml`은 `v*` 태그 push 시 6개 플랫폼 바이너리를 빌드해 GitHub Release를 발행하며, `docker.yml`은 멀티 아키텍처 Docker 이미지를 GHCR에 공개합니다.
 
 ### 크로스 컴파일(대상 OS 불필요)
 
@@ -95,6 +95,23 @@ GOOS=linux GOARCH=amd64 go build -o ysign-linux-amd64 ./cmd/ysign
 # Windows
 GOOS=windows GOARCH=amd64 go build -o ysign.exe ./cmd/ysign
 ```
+
+> Windows 실행 파일에는 버전 정보(제품명, 버전, 저작권)가 내장되어 있어 일부 백신의 오탐지를 줄입니다. 새 릴리스 시 `cmd/ysign/versioninfo.json`을 갱신한 뒤 `make resources`로 다시 생성하세요.
+
+### Docker(CI/CD)
+
+이미지는 GitHub Container Registry에 `linux/amd64`, `linux/arm64`로 공개됩니다:
+
+```bash
+# 가져오기
+docker pull ghcr.io/iyiyus/ysign:latest
+
+# 서명: 현재 디렉터리를 컨테이너의 /work에 마운트
+docker run --rm -v "$PWD":/work ghcr.io/iyiyus/ysign \
+  -k cert.p12 -p 비밀번호 -m dev.mobileprovision -o signed.ipa input.ipa
+```
+
+> 컨테이너 작업 디렉터리는 `/work`이며 인증서, 프로파일, ipa는 볼륨 마운트로 전달합니다. `v*` 태그 push 시 `latest`와 버전 이미지가, `main` 브랜치에서는 `edge`가 공개됩니다. 로컬에서는 `make docker`로 빌드할 수 있습니다.
 
 ### 최소 재서명
 

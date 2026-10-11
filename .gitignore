@@ -4,7 +4,9 @@
 /ysign
 /ysign-darwin-*
 /ysign-linux-*
+/ysign-windows-*
 /dist/
+/dist-test/
 
 # --- Output / test ipa packages ---
 *.ipa

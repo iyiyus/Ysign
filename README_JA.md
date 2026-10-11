@@ -81,7 +81,7 @@ make test       # テストを実行
 make release    # darwin + linux + windows をクロスコンパイル
 ```
 
-> リポジトリには GitHub Actions を同梱：`ci.yml` は push のたびに `go vet` + `go test` を実行、`release.yml` は `v*` タグ push 時に 5 プラットフォームのバイナリをビルドし GitHub Release を公開します。
+> リポジトリには GitHub Actions を同梱：`ci.yml` は push のたびに `go vet` + `go test` を実行、`release.yml` は `v*` タグ push 時に 6 プラットフォームのバイナリをビルドし GitHub Release を公開、`docker.yml` はマルチアーキテクチャ Docker イメージを GHCR に公開します。
 
 ### クロスコンパイル（対象 OS 不要）
 
@@ -95,6 +95,23 @@ GOOS=linux GOARCH=amd64 go build -o ysign-linux-amd64 ./cmd/ysign
 # Windows
 GOOS=windows GOARCH=amd64 go build -o ysign.exe ./cmd/ysign
 ```
+
+> Windows 実行ファイルにはバージョン情報（製品名、バージョン、著作権）を埋め込み済みで、一部アンチウイルスの誤検知を抑えます。新リリース時は `cmd/ysign/versioninfo.json` を更新し `make resources` で再生成してください。
+
+### Docker（CI/CD）
+
+イメージは GitHub Container Registry で `linux/amd64` と `linux/arm64` を公開しています：
+
+```bash
+# 取得
+docker pull ghcr.io/iyiyus/ysign:latest
+
+# 署名：カレントディレクトリをコンテナの /work にマウント
+docker run --rm -v "$PWD":/work ghcr.io/iyiyus/ysign \
+  -k cert.p12 -p パスワード -m dev.mobileprovision -o signed.ipa input.ipa
+```
+
+> コンテナの作業ディレクトリは `/work` で、証明書・プロファイル・ipa はボリュームマウントで渡します。`v*` タグ push で `latest` とバージョン付きイメージ、`main` ブランチで `edge` を公開。ローカルでは `make docker` でビルドできます。
 
 ### 最小限の再署名
 

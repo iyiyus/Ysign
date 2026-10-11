@@ -1,0 +1,15 @@
+.git
+.github
+*.exe
+ysign
+ysign-darwin-*
+ysign-linux-*
+dist
+*.ipa
+*.p12
+*.mobileprovision
+test
+.zsign_cache
+.ysign_cache
+Dockerfile
+.dockerignore

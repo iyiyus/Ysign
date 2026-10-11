@@ -81,7 +81,7 @@ make test       # 运行测试
 make release    # 交叉编译 darwin + linux + windows
 ```
 
-> 仓库含 GitHub Actions：`ci.yml` 在每次 push 自动跑 `go vet` + `go test`；`release.yml` 在打 `v*` tag 时自动构建 5 个平台的二进制并发布 GitHub Release。
+> 仓库含 GitHub Actions：`ci.yml` 在每次 push 自动跑 `go vet` + `go test`；`release.yml` 在打 `v*` tag 时自动构建 6 个平台的二进制并发布 GitHub Release；`docker.yml` 同步发布多架构 Docker 镜像到 GHCR。
 
 ### 交叉编译（无需目标平台）
 
@@ -95,6 +95,23 @@ GOOS=linux GOARCH=amd64 go build -o ysign-linux-amd64 ./cmd/ysign
 # Windows
 GOOS=windows GOARCH=amd64 go build -o ysign.exe ./cmd/ysign
 ```
+
+> Windows 可执行文件已内嵌版本信息（产品名、版本号、版权），可降低部分杀软误报；发新版时更新 `cmd/ysign/versioninfo.json` 后执行 `make resources` 重新生成。
+
+### Docker（CI/CD）
+
+镜像发布在 GitHub Container Registry，支持 `linux/amd64` 与 `linux/arm64`：
+
+```bash
+# 拉取
+docker pull ghcr.io/iyiyus/ysign:latest
+
+# 签名：把当前目录挂载到容器的 /work
+docker run --rm -v "$PWD":/work ghcr.io/iyiyus/ysign \
+  -k cert.p12 -p 密码 -m dev.mobileprovision -o signed.ipa input.ipa
+```
+
+> 容器工作目录为 `/work`，证书、描述文件与 ipa 通过卷挂载传入。推送 `v*` tag 时 CI 自动发布 `latest` 与对应版本号镜像，`main` 分支发布 `edge`；也可本地执行 `make docker` 构建。
 
 ### 最简单的重签名
 
