@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/crypto/ocsp"
 
+	"ysign/internal/ipautil"
 	"ysign/internal/macho"
 	"ysign/internal/plistutil"
 	"ysign/internal/signing"
@@ -175,12 +176,51 @@ Expires: %s (%s)`,
 			out += "\n" + DescribeCert(p.DeveloperCertificates[0])
 		}
 		return out, nil
+	case ".ipa":
+		return checkIPA(path)
 	}
 	// Certificate (PEM/DER) or Mach-O / IPA.
 	if c, err := ParseCertificateBytes(data); err == nil {
 		return DescribeCert(c), nil
 	}
 	return DescribeSignature(data)
+}
+
+// checkIPA inspects the code signature of an IPA's main executable and reports
+// its embedded provisioning profile, mirroring zsign's -C IPA support.
+func checkIPA(path string) (string, error) {
+	tmp, err := os.MkdirTemp("", "ysign-check-")
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(tmp)
+	appDir, err := ipautil.UnzipIPA(path, tmp)
+	if err != nil {
+		return "", fmt.Errorf("not a valid IPA: %w", err)
+	}
+	var out string
+	if data, err := os.ReadFile(filepath.Join(appDir, "embedded.mobileprovision")); err == nil {
+		if p, perr := signing.ParseProvision(data); perr == nil {
+			out += fmt.Sprintf("IPA: %s\nProvision: %s\nAppID: %s\nTeam: %s\n",
+				filepath.Base(path), p.Name, p.AppIdentifier, p.TeamID())
+		}
+	}
+	if infoData, err := os.ReadFile(filepath.Join(appDir, "Info.plist")); err == nil {
+		if info, perr := plistutil.Decode(infoData); perr == nil {
+			if mainName := plistutil.GetString(info, "CFBundleExecutable"); mainName != "" {
+				if mainData, rerr := os.ReadFile(filepath.Join(appDir, mainName)); rerr == nil {
+					if sig, serr := DescribeSignature(mainData); serr == nil {
+						out += sig
+						return out, nil
+					}
+				}
+			}
+		}
+	}
+	if out == "" {
+		return "", errors.New("no code signature found in IPA")
+	}
+	return out, nil
 }
 
 // DescribeSignature inspects a Mach-O binary or IPA file's code signature.

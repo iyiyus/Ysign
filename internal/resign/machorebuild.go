@@ -37,6 +37,14 @@ type signContext struct {
 	// KeepAllSpecialHashes true for embedded (framework/appex) binaries whose
 	// Info/entitlements are unchanged, so their original special hashes are reused.
 	KeepAllSpecialHashes bool
+	// ForceSHA256 (from -2/--sha256_only) rebuilds the CodeDirectory with a
+	// SHA-256 hash type instead of inheriting the original binary's hash type.
+	ForceSHA256 bool
+	// SpecialInfoPlist and SpecialCodeResources are the owning bundle's
+	// Info.plist and CodeResources file bytes, used to recompute special slots
+	// (-1 / -3) at the active hash size when forcing SHA-256.
+	SpecialInfoPlist    []byte
+	SpecialCodeResources []byte
 }
 
 // rebuildBinary re-signs every slice of a thin or universal binary.
@@ -85,18 +93,39 @@ func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 	if pageSize == 0 {
 		pageSize = 12
 	}
+	if ctx.ForceSHA256 {
+		hashType, hashSize = signing.HashSHA256, 32
+	}
 
 	codeLimit := thin.Signature.DataOffset
 	if codeLimit == 0 || int(codeLimit) > len(thin.Data) {
 		codeLimit = uint32(len(thin.Data))
 	}
-	// special slot hashes
+	// Determine requirements + entitlements blobs to carry into the superblob.
+	var reqBlob []byte
+	if sb.RequirementsSlot != nil && sb.RequirementsSlot.Blob != nil {
+		reqBlob = sb.RequirementsSlot.Blob.Data
+	}
+	var entBlob []byte
+	if ctx.EntitlementsXML != nil {
+		entBlob = signing.BuildEntitlementsBlob(ctx.EntitlementsXML)
+	} else if sb.EntitlementsSlot != nil && sb.EntitlementsSlot.Blob != nil {
+		entBlob = sb.EntitlementsSlot.Blob.Data
+	}
+
+	// Special slot hashes.
 	nSpecial := int(cd.NSpecialSlots)
 	special := make([][]byte, nSpecial)
 	for i := 0; i < nSpecial; i++ {
 		special[i] = cd.SpecialSlotHash(-(i + 1))
 	}
-	if !ctx.KeepAllSpecialHashes {
+	if ctx.ForceSHA256 {
+		// -2/--sha256_only: recompute every special slot at the forced SHA-256
+		// size from the actual sealed data (Info.plist, requirements,
+		// CodeResources, entitlements), zero-filling slots whose data is
+		// unavailable -- mirroring upstream zsign.
+		special = specialHashesAt(special, ctx, reqBlob, entBlob, hashType, hashSize)
+	} else if !ctx.KeepAllSpecialHashes {
 		if ctx.InfoPlist != nil && nSpecial > 0 {
 			if h, err := signing.HashBytes(hashType, ctx.InfoPlist); err == nil {
 				special[0] = h // slot -1
@@ -108,18 +137,6 @@ func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 				special[4] = h // slot -5
 			}
 		}
-	}
-
-	// Determine requirements + entitlements blobs to carry into the superblob.
-	var reqBlob []byte
-	if sb.RequirementsSlot != nil && sb.RequirementsSlot.Blob != nil {
-		reqBlob = sb.RequirementsSlot.Blob.Data
-	}
-	var entBlob []byte
-	if ctx.EntitlementsXML != nil {
-		entBlob = signing.BuildEntitlementsBlob(ctx.EntitlementsXML)
-	} else if sb.EntitlementsSlot != nil && sb.EntitlementsSlot.Blob != nil {
-		entBlob = sb.EntitlementsSlot.Blob.Data
 	}
 
 	// Determine identifier/team: only the main binary gets the new identity;
@@ -230,6 +247,50 @@ func hashSizeFor(hashType uint8) int {
 	default:
 		return 0
 	}
+}
+
+// specialHashesAt recomputes special slot hashes at the given hash size for a
+// forced SHA-256 code directory. Slots -1, -2, -3 and -5 are derived from the
+// sealed Info.plist, requirements blob, CodeResources and entitlements blob
+// respectively; other slots are kept when their original size already matches,
+// otherwise zero-filled.
+func specialHashesAt(orig [][]byte, ctx *signContext, reqBlob, entBlob []byte, hashType, hashSize uint8) [][]byte {
+	out := make([][]byte, len(orig))
+	zero := make([]byte, hashSize)
+	hash := func(data []byte) []byte {
+		if len(data) == 0 {
+			return zero
+		}
+		if h, err := signing.HashBytes(hashType, data); err == nil {
+			return h
+		}
+		return zero
+	}
+	reuse := func(i int) []byte {
+		if len(orig[i]) == int(hashSize) {
+			return orig[i]
+		}
+		return zero
+	}
+	for i := range orig {
+		switch i {
+		case 0: // -1 Info.plist
+			src := ctx.SpecialInfoPlist
+			if src == nil {
+				src = ctx.InfoPlist
+			}
+			out[i] = hash(src)
+		case 1: // -2 requirements
+			out[i] = hash(reqBlob)
+		case 2: // -3 CodeResources
+			out[i] = hash(ctx.SpecialCodeResources)
+		case 4: // -5 entitlements
+			out[i] = hash(entBlob)
+		default:
+			out[i] = reuse(i)
+		}
+	}
+	return out
 }
 
 // buildSignature produces the CMS signature blob (or ad-hoc) for a CD.

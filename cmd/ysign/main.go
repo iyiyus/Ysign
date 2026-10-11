@@ -20,6 +20,9 @@ import (
 
 type stringList []string
 
+// version is bumped on releases; it is also injected by the build workflow.
+var version = "1.0.0"
+
 func (s *stringList) String() string { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error {
 	*s = append(*s, v)
@@ -45,7 +48,7 @@ func main() {
 		metadata         string
 		R, S, E, W, U, P bool
 		M                string
-		q                bool
+		q, debug, showV  bool
 	)
 	fs := flag.NewFlagSet("ysign", flag.ExitOnError)
 	fs.StringVar(&k, "k", "", "Path to private key or p12 file")
@@ -106,6 +109,10 @@ func main() {
 	fs.BoolVar(&P, "inject_extensions", false, "Also inject dylibs into extensions")
 	fs.BoolVar(&q, "q", false, "Quiet operation")
 	fs.BoolVar(&q, "quiet", false, "Quiet operation")
+	fs.BoolVar(&debug, "d", false, "Keep intermediate files and print the work directory")
+	fs.BoolVar(&debug, "debug", false, "Keep intermediate files and print the work directory")
+	fs.BoolVar(&showV, "v", false, "Show version")
+	fs.BoolVar(&showV, "version", false, "Show version")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, `ysign - fast cross-platform iOS code signing tool (zsign-compatible)
 
@@ -116,6 +123,7 @@ Options:
   -m, --prov           Path to provisioning profile (repeat for extensions)
   -c, --cert           Path to certificate file (PEM or DER)
   -a, --adhoc          Perform ad-hoc signature only
+  -d, --debug          Keep intermediate files and print the work directory
   -f, --force          Force sign without cache
   -o, --output         Path to output ipa file
   -p, --password       Password for private key or p12 file
@@ -130,7 +138,7 @@ Options:
   -w, --weak           Inject dylib as weak (repeatable)
   -i, --install        Install via ideviceinstaller after signing
   -t, --temp_folder    Temp folder for intermediate files
-  -2, --sha256_only    Use SHA256-only code directory
+  -2, --sha256_only    Force SHA256-only code directory
   -C, --check          Check certificate / signature
   -x, --metadata       Extract metadata and icon to directory
   -R, --rm_provision   Remove provisioning profile after signing
@@ -141,9 +149,15 @@ Options:
   -U, --rm_uisd        Remove UISupportedDevices
   -P, --inject_extensions Also inject dylibs into extensions
   -q, --quiet          Quiet operation
+  -v, --version        Show version
+  -h, --help           Show help
 `)
 	}
 	fs.Parse(os.Args[1:])
+	if showV {
+		fmt.Printf("ysign %s\n", version)
+		return
+	}
 	args := fs.Args()
 	if len(args) < 1 {
 		fs.Usage()
@@ -151,7 +165,8 @@ Options:
 	}
 	input := args[0]
 
-	// Check mode.
+	// Check mode. When signing is also requested (e.g. -C -k ... -m ... -o ...),
+	// verify the certificate / signature first, then continue to sign.
 	if check {
 		report, err := inspect.CheckFile(input, p)
 		if err != nil {
@@ -159,7 +174,9 @@ Options:
 			os.Exit(1)
 		}
 		fmt.Println(report)
-		return
+		if k == "" && !a {
+			return
+		}
 	}
 
 	// Metadata mode.
@@ -211,7 +228,11 @@ Options:
 		fmt.Fprintln(os.Stderr, "workdir:", err)
 		os.Exit(1)
 	}
-	defer cleanup()
+	if debug {
+		fmt.Fprintf(os.Stderr, "debug: workdir=%s (kept)\n", workDir)
+	} else {
+		defer cleanup()
+	}
 
 	appDir, err := resolveAppDir(input, workDir)
 	if err != nil {
@@ -230,6 +251,7 @@ Options:
 		Force:              f,
 		Quiet:              q,
 		CacheDir:           cacheDir,
+		ForceSHA256:        sha256Only,
 		EnableDocs:         S,
 		RemoveExtensions:   E,
 		RemoveWatch:        W,

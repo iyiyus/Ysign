@@ -17,7 +17,7 @@ Xcode も macOS も不要。単一バイナリで `.ipa` / `.app` を再署名�
 
 `ysign` は **純 Go** で書かれたクロスプラットフォームな iOS コード署名 / 再署名ツールで、[zsign](https://github.com/zhlynn/zsign) の機能互換代替として実装されています。Xcode にも macOS にも依存せず、あなたの証明書（`.p12` / PEM）とプロビジョニングプロファイル（`.mobileprovision`）を使うだけで、1 コマンドで `.ipa` や `.app` を再署名できます。
 
-コード署名スタックは **すべて自作** です。Mach-O（fat / thin）の解析、SHA-256 CodeDirectory の再構築、そしてサードパーティライブラリに依存しない CMS / PKCS#7 署名の生成（RSA / ECDSA 対応）を備えています。「署名を速く」という要望に応え、コンテンツアドレス方式のディスクキャッシュを実装。23MB・38 バイナリのアプリをコールドで **約 2.4 秒**、キャッシュが効けばさらに高速です。
+コード署名スタックは **すべて自作** です。Mach-O（fat / thin）の解析、SHA-256 CodeDirectory の再構築、そしてサードパーティライブラリに依存しない CMS / PKCS#7 署名の生成（RSA / ECDSA 対応）を備えています。「署名を速く」という要望に応え、**マルチスレッド並列署名**（CPU 数ぶんのワーカープールで各バイナリを並列処理）とコンテンツアドレス方式のディスクキャッシュを実装。23MB・38 バイナリのアプリをコールドで **約 2.0 秒**、キャッシュヒット時 **約 1.7 秒** です。
 
 ---
 
@@ -36,15 +36,18 @@ Xcode も macOS も不要。単一バイナリで `.ipa` / `.app` を再署名�
 - `-a` ad-hoc 署名（証明書不要）
 
 **検査とメタデータ**
-- `-C` 証明書 / プロファイル / コード署名の検査（ベストエフォートの OCSP 付き）
+- `-C` 証明書 / プロファイル / コード署名の検査（ベストエフォートの OCSP 付き）。`.ipa`、`.p12`、`.mobileprovision`、`.cer`、Mach-O に対応
 - `-x` `metadata.json` とアプリアイコンの書き出し
+- `-v` バージョン表示、`-d` 中間ファイルを保持してデバッグ
 
 **クリーンアップとパッケージング**
 - `-E` 拡張削除、`-W` Watch 削除、`-U` `UISupportedDevices` のクリア、`-R` プロファイル削除
 - `-z 0-9` 圧縮レベル、`-o` 出力先、`-t` 一時 / キャッシュディレクトリ
 
 **パフォーマンス**
+- **マルチスレッド並列署名**：CPU 数ぶんのワーカープールで複数バイナリを同時処理し、コールド署名を大幅に高速化
 - コンテンツアドレス方式のディスクキャッシュ（ページハッシュ、CMS 署名）。`-f` でバイパス、`-t` でディレクトリ指定
+- `-2` で SHA-256 CodeDirectory を本格的に強制（特殊スロットを実データから再計算、zsign に合わせる）
 
 ---
 
@@ -69,6 +72,16 @@ Xcode も macOS も不要。単一バイナリで `.ipa` / `.app` を再署名�
 ```bash
 go build -o ysign ./cmd/ysign
 ```
+
+または `Makefile` で一括ビルド / クロスコンパイル / テスト：
+
+```bash
+make build      # 現在のプラットフォーム用にビルド
+make test       # テストを実行
+make release    # darwin + linux + windows をクロスコンパイル
+```
+
+> リポジトリには GitHub Actions を同梱：`ci.yml` は push のたびに `go vet` + `go test` を実行、`release.yml` は `v*` タグ push 時に 5 プラットフォームのバイナリをビルドし GitHub Release を公開します。
 
 ### クロスコンパイル（対象 OS 不要）
 
@@ -100,6 +113,7 @@ Usage: ysign [-options] [-k privkey.pem] [-m dev.prov] [-o output.ipa] file|fold
   -m, --prov            プロビジョニングプロファイルのパス（拡張用に繰り返し指定可）
   -c, --cert            証明書ファイルのパス（PEM または DER）
   -a, --adhoc           ad-hoc 署名のみ実行
+  -d, --debug           中間ファイルを保持し作業ディレクトリを表示
   -f, --force           キャッシュを使わず強制署名
   -o, --output          出力 ipa ファイルのパス
   -p, --password        秘密鍵または p12 のパスワード
@@ -114,8 +128,8 @@ Usage: ysign [-options] [-k privkey.pem] [-m dev.prov] [-o output.ipa] file|fold
   -w, --weak            dylib を weak として注入（繰り返し指定可）
   -i, --install         署名後に ideviceinstaller でインストール
   -t, --temp_folder     中間ファイルの一時 / キャッシュディレクトリ
-  -2, --sha256_only     SHA256 のみの code directory を使用
-  -C, --check           証明書 / プロファイル / 署名を検査
+  -2, --sha256_only     SHA256 のみの code directory を強制（特殊スロットも再計算）
+  -C, --check           証明書 / プロファイル / 署名を検査（ipa 対応）
   -x, --metadata        メタデータとアイコンをディレクトリへ書き出し
   -R, --rm_provision    署名後にプロビジョニングプロファイルを削除
   -S, --enable_docs     UISupportsDocumentBrowser / UIFileSharingEnabled を有効化
@@ -125,6 +139,8 @@ Usage: ysign [-options] [-k privkey.pem] [-m dev.prov] [-o output.ipa] file|fold
   -U, --rm_uisd         UISupportedDevices を削除
   -P, --inject_extensions 拡張にも dylib を注入
   -q, --quiet           静かに実行
+  -v, --version         バージョンを表示
+  -h, --help            ヘルプを表示
 ```
 
 > 入力は `.ipa`、`.app`、または `Payload` を含むディレクトリ。`.app` はその場で署名、`.ipa` は一時ディレクトリに展開して署名後に再パックし、既定では現在のディレクトリへ `xxx-ysign.ipa` を出力します。
@@ -173,7 +189,7 @@ ysign -x outdir app.ipa
 3. **CodeDirectory の再構築**：元バイナリの hashType / pageSize / version / flags から CD を再構築（ヘッダ → identifier → team → 特殊スロットハッシュ → コードページハッシュ）。
 4. **CMS 生成**：自作の `SignedData`（SHA-256、RSA / ECDSA）、eContent は標準の `[0] EXPLICIT OCTET STRING`、署名者証明書チェーンを埋め込み。
 5. **superblob の組み立て**：CodeDirectory + Requirements + Entitlements + Signature の各スロット。
-6. **2 パス署名**：パス 1 でページハッシュを計算し最終サイズを確定して datasize をパッチ、パス 2 でパッチ後のコードを再ハッシュして自己整合性を確保。
+6. **2 パス署名 + 並列**：バイナリは互いに独立しているため、CPU 数ぶんのワーカープールで並列署名。各バイナリはパス 1 でページハッシュを計算し最終サイズを確定して datasize をパッチ、パス 2 でパッチ後のコードを再ハッシュして自己整合性を確保。
 7. **再パック**：設定可能な圧縮レベルで `.ipa` として再圧縮。
 
 **メインバイナリ**は新しい bundle id / team に切り替え、特殊スロット `-1`（Info）と `-5`（Entitlements）を再計算します。**埋め込みバイナリ**（framework / appex）は自身の identifier と特殊スロットハッシュを保持します。
@@ -197,7 +213,7 @@ go test ./...   # ユニット + 統合テスト
 go vet ./...    # 静的解析
 ```
 
-`internal/macho`、`internal/signing`、`internal/resign` をカバー。Mach-O 解析、CMS 往復、ディスクキャッシュ、プロファイル解析、エンドツーエンドの再署名フロー（ad-hoc と再署名キャッシュ経路を含む）を検証しています。
+`internal/macho`、`internal/signing`、`internal/resign` をカバー。Mach-O 解析、CMS 往復、ディスクキャッシュ、プロファイル解析、エンドツーエンドの再署名フロー（ad-hoc、並列、再署名キャッシュ経路を含む）を検証しています。CI（`.github/workflows/ci.yml`）が push のたびに上記を実行します。
 
 ---
 

@@ -9,7 +9,9 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 
 	"ysign/internal/macho"
 	"ysign/internal/plistutil"
@@ -38,6 +40,9 @@ type Options struct {
 	RemoveDylibs       []string
 	WeakDylibs         []string
 	InjectToExtensions bool
+	// ForceSHA256 (from -2/--sha256_only) rebuilds every CodeDirectory with a
+	// SHA-256 hash type instead of inheriting the original binary's hash type.
+	ForceSHA256 bool
 	// ExtProfiles are provisioning profiles for app extensions. The first entry
 	// (when present) is treated as the main profile and embedded into the app;
 	// the rest are matched to extension bundles by bundle id.
@@ -181,6 +186,11 @@ func Resign(appDir string, opts *Options) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
+		// Skip the Apple Watch stub: re-signing it triggers
+		// InvalidStubExecutableError during install (matches upstream zsign).
+		if filepath.Base(path) == "_WatchKitStub" {
+			return nil
+		}
 		if isMachO(path) {
 			binaries = append(binaries, path)
 		}
@@ -189,19 +199,52 @@ func Resign(appDir string, opts *Options) error {
 		return err
 	}
 
-	for _, bin := range binaries {
-		isMain := bin == mainPath
+	isMainBin := func(bin string) bool { return bin == mainPath }
+	// A binary receives dylib injection when it is the main executable, or when
+	// -P injects into every binary (extensions included).
+	injectAllowed := func(isMain bool) bool { return isMain || opts.InjectToExtensions }
+
+	// Pre-copy injected dylibs into their target directories sequentially so the
+	// parallel signing pass never races writing the same destination file.
+	isFileDylib := make(map[string]bool, len(opts.InjectDylibs))
+	if len(opts.InjectDylibs) > 0 {
+		copied := make(map[string]bool)
+		for _, bin := range binaries {
+			if !injectAllowed(isMainBin(bin)) {
+				continue
+			}
+			for _, d := range opts.InjectDylibs {
+				if st, err := os.Stat(d); err == nil && !st.IsDir() {
+					dest := filepath.Join(filepath.Dir(bin), filepath.Base(d))
+					if !copied[dest] {
+						if err := copyFile(d, dest); err != nil {
+							return err
+						}
+						copied[dest] = true
+					}
+					isFileDylib[d] = true
+				}
+			}
+		}
+	}
+
+	// signOne re-signs a single binary in place. Every input it needs is
+	// precomputed above, so it is safe to run concurrently.
+	signOne := func(bin string, isMain bool) error {
 		data, err := os.ReadFile(bin)
 		if err != nil {
 			return err
 		}
-		// dylib injection / removal (before signing so hashes cover final bytes).
 		for _, d := range opts.InjectDylibs {
-			if !opts.InjectToExtensions && !isMain {
-				continue
+			if !injectAllowed(isMain) {
+				break
+			}
+			loadPath := d
+			if isFileDylib[d] {
+				loadPath = "@executable_path/" + filepath.Base(d)
 			}
 			weak := containsString(opts.WeakDylibs, d)
-			data, err = applyInject(filepath.Dir(bin), d, weak, data)
+			data, err = macho.AddLoadDylib(data, loadPath, weak)
 			if err != nil {
 				return fmt.Errorf("inject dylib %s into %s: %w", d, filepath.Base(bin), err)
 			}
@@ -216,17 +259,28 @@ func Resign(appDir string, opts *Options) error {
 		if isMain {
 			ctx = &signContext{
 				BundleID: bundleID, TeamID: teamID, AdHoc: opts.AdHoc, Force: opts.Force,
-				Cache: cache, Signer: opts.Signer,
+				Cache: cache, Signer: opts.Signer, ForceSHA256: opts.ForceSHA256,
 				InfoPlist: infoBytes, EntitlementsXML: entitlementsXML,
 				KeepAllSpecialHashes: false,
 			}
 		} else if extCtx := extCtxFor(bin, extProfiles, cache, opts); extCtx != nil {
+			extCtx.ForceSHA256 = opts.ForceSHA256
 			ctx = extCtx
 		} else {
 			ctx = &signContext{
 				BundleID: bundleID, TeamID: teamID, AdHoc: opts.AdHoc, Force: opts.Force,
-				Cache: cache, Signer: opts.Signer,
+				Cache: cache, Signer: opts.Signer, ForceSHA256: opts.ForceSHA256,
 				KeepAllSpecialHashes: true,
+			}
+		}
+		// For -2/--sha256_only, special slots -1/-3 are recomputed from the owning
+		// bundle's Info.plist and CodeResources, so gather those file bytes.
+		if bdir := owningBundle(bin); bdir != "" {
+			if b, err := os.ReadFile(filepath.Join(bdir, "Info.plist")); err == nil {
+				ctx.SpecialInfoPlist = b
+			}
+			if b, err := os.ReadFile(filepath.Join(bdir, "CodeResources")); err == nil {
+				ctx.SpecialCodeResources = b
 			}
 		}
 		out, err := rebuildBinary(data, ctx)
@@ -239,26 +293,108 @@ func Resign(appDir string, opts *Options) error {
 		if isMain {
 			logf(opts, "signed main: %s", filepath.Base(bin))
 		}
+		return nil
+	}
+
+	// Parallel signing: binaries are independent, so process them with a bounded
+	// worker pool sized to the CPU count. This materially speeds up cold
+	// (cache-less) re-signing of apps with many binaries.
+	if err := parallelFor(len(binaries), func(i int) error {
+		return signOne(binaries[i], isMainBin(binaries[i]))
+	}); err != nil {
+		return err
 	}
 	logf(opts, "re-signed %d binary(ies), bundle id=%s team=%s adhoc=%v", len(binaries), bundleID, teamID, opts.AdHoc)
 	return nil
 }
 
-// applyInject copies a local dylib into the bundle directory (when it is an
-// existing file) and adds an LC_LOAD_DYLIB load command to the binary bytes.
-func applyInject(dir, dylib string, weak bool, data []byte) ([]byte, error) {
-	loadPath := dylib
-	if st, err := os.Stat(dylib); err == nil && !st.IsDir() {
-		base := filepath.Base(dylib)
-		dest := filepath.Join(dir, base)
-		if err := copyFile(dylib, dest); err != nil {
-			return nil, err
-		}
-		loadPath = "@executable_path/" + base
+// parallelFor runs fn(i) for i in [0,n) across a bounded worker pool sized to
+// the number of CPUs, returning the first non-nil error. When only one worker
+// is needed it runs inline to avoid goroutine overhead.
+func parallelFor(n int, fn func(int) error) error {
+	if n <= 0 {
+		return nil
 	}
-	return macho.AddLoadDylib(data, loadPath, weak)
+	workers := runtime.NumCPU()
+	if workers > n {
+		workers = n
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers == 1 {
+		for i := 0; i < n; i++ {
+			if err := fn(i); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	jobs := make(chan int)
+	var (
+		mu     sync.Mutex
+		first  error
+		cancel bool
+		wg     sync.WaitGroup
+	)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				mu.Lock()
+				stopped := cancel
+				mu.Unlock()
+				if stopped {
+					return
+				}
+				if err := fn(i); err != nil {
+					mu.Lock()
+					if first == nil {
+						first = err
+					}
+					cancel = true
+					mu.Unlock()
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for i := 0; i < n; i++ {
+			mu.Lock()
+			stopped := cancel
+			mu.Unlock()
+			if stopped {
+				return
+			}
+			jobs <- i
+		}
+	}()
+	wg.Wait()
+	return first
 }
 
+// owningBundle returns the nearest enclosing bundle directory (.app, .appex,
+// .framework or .bundle) for a binary path, or the binary's own directory.
+func owningBundle(bin string) string {
+	d := filepath.Dir(bin)
+	for {
+		low := strings.ToLower(filepath.Base(d))
+		if strings.HasSuffix(low, ".app") || strings.HasSuffix(low, ".appex") ||
+			strings.HasSuffix(low, ".framework") || strings.HasSuffix(low, ".bundle") {
+			return d
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return filepath.Dir(bin)
+		}
+		d = parent
+	}
+}
+
+// copyFile copies src to dst.
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {

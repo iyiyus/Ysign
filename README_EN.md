@@ -17,7 +17,7 @@ No Xcode, no macOS. A single binary re-signs `.ipa` / `.app`.
 
 `ysign` is a **pure Go** cross-platform iOS code signing / re-signing tool, implemented as a feature-compatible replacement for [zsign](https://github.com/zhlynn/zsign). It does not depend on Xcode or macOS: with a single command you can re-sign an `.ipa` or `.app` using your certificate (`.p12` / PEM) and provisioning profile (`.mobileprovision`).
 
-The core code-signing stack is **entirely self-built**: Mach-O (fat / thin) parsing, SHA-256 CodeDirectory rebuilding, and CMS / PKCS#7 signature generation without any third-party library (RSA and ECDSA supported). To make signing fast, a content-addressed disk cache is used: re-signing a 23MB app with 38 binaries takes **~2.4 s** cold, and faster with a warm cache.
+The core code-signing stack is **entirely self-built**: Mach-O (fat / thin) parsing, SHA-256 CodeDirectory rebuilding, and CMS / PKCS#7 signature generation without any third-party library (RSA and ECDSA supported). To make signing fast, it uses **multi-threaded parallel signing** (a worker pool sized to your CPU count) plus a content-addressed disk cache: re-signing a 23MB app with 38 binaries takes **~2.0 s** cold, **~1.7 s** with a warm cache.
 
 ---
 
@@ -36,15 +36,18 @@ The core code-signing stack is **entirely self-built**: Mach-O (fat / thin) pars
 - `-a` ad-hoc signing (no certificate)
 
 **Inspection & metadata**
-- `-C` inspect certificate / profile / code signature (with best-effort OCSP)
+- `-C` inspect certificate / profile / code signature (with best-effort OCSP), supporting `.ipa`, `.p12`, `.mobileprovision`, `.cer`, Mach-O
 - `-x` export `metadata.json` and the app icon
+- `-v` show version, `-d` keep intermediate files for debugging
 
 **Cleanup & packaging**
 - `-E` remove extensions, `-W` remove Watch, `-U` clear `UISupportedDevices`, `-R` remove the profile
 - `-z 0-9` compression level, `-o` output path, `-t` temp / cache dir
 
 **Performance**
+- **Multi-threaded parallel signing**: a worker pool sized to the CPU count processes multiple binaries at once, noticeably speeding up cold signs
 - Content-addressed disk cache (page hashes, CMS signatures), bypass with `-f`, custom dir with `-t`
+- `-2` truly forces a SHA-256 CodeDirectory (special slots recomputed from real data, aligned with zsign)
 
 ---
 
@@ -69,6 +72,16 @@ The core code-signing stack is **entirely self-built**: Mach-O (fat / thin) pars
 ```bash
 go build -o ysign ./cmd/ysign
 ```
+
+Or use the `Makefile` for one-shot build / cross-compile / test:
+
+```bash
+make build      # build for the host platform
+make test       # run tests
+make release    # cross-compile darwin + linux + windows
+```
+
+> The repo ships GitHub Actions: `ci.yml` runs `go vet` + `go test` on every push; `release.yml` builds 5 platform binaries and publishes a GitHub Release when a `v*` tag is pushed.
 
 ### Cross-compile (no target platform needed)
 
@@ -100,6 +113,7 @@ Usage: ysign [-options] [-k privkey.pem] [-m dev.prov] [-o output.ipa] file|fold
   -m, --prov            Path to provisioning profile (repeat for extensions)
   -c, --cert            Path to certificate file (PEM or DER)
   -a, --adhoc           Perform ad-hoc signature only
+  -d, --debug           Keep intermediate files and print the work directory
   -f, --force           Force sign without cache
   -o, --output          Path to output ipa file
   -p, --password        Password for private key or p12 file
@@ -114,8 +128,8 @@ Usage: ysign [-options] [-k privkey.pem] [-m dev.prov] [-o output.ipa] file|fold
   -w, --weak            Inject dylib as weak (repeatable)
   -i, --install         Install via ideviceinstaller after signing
   -t, --temp_folder     Temp folder for intermediate files
-  -2, --sha256_only     Use SHA256-only code directory
-  -C, --check           Check certificate / signature
+  -2, --sha256_only     Force SHA256-only code directory (incl. special-slot recompute)
+  -C, --check           Check certificate / signature (supports ipa)
   -x, --metadata        Extract metadata and icon to directory
   -R, --rm_provision    Remove provisioning profile after signing
   -S, --enable_docs     Enable UISupportsDocumentBrowser / UIFileSharingEnabled
@@ -125,6 +139,8 @@ Usage: ysign [-options] [-k privkey.pem] [-m dev.prov] [-o output.ipa] file|fold
   -U, --rm_uisd         Remove UISupportedDevices
   -P, --inject_extensions Also inject dylibs into extensions
   -q, --quiet           Quiet operation
+  -v, --version         Show version
+  -h, --help            Show help
 ```
 
 > The input can be an `.ipa`, an `.app`, or a directory containing `Payload`. `.app` is signed in place; `.ipa` is extracted to a temp dir, signed, and re-packed, by default to `xxx-ysign.ipa` in the current directory.
@@ -173,7 +189,7 @@ ysign -x outdir app.ipa
 3. **Rebuild CodeDirectory**: rebuild the CD from the original hashType / pageSize / version / flags (header → identifier → team → special-slot hashes → code-page hashes).
 4. **Generate CMS**: self-built `SignedData` (SHA-256, RSA / ECDSA), eContent as standard `[0] EXPLICIT OCTET STRING`, embedding the signer certificate chain.
 5. **Assemble superblob**: CodeDirectory + Requirements + Entitlements + Signature slots.
-6. **Two-pass signing**: pass 1 computes page hashes, gets the final size, and patches the datasize; pass 2 re-hashes the patched code so the signature is self-consistent.
+6. **Two-pass signing + parallel**: binaries are independent, so a worker pool sized to the CPU count signs them in parallel; each binary first hashes pages, gets the final size, and patches the datasize, then pass 2 re-hashes the patched code so the signature is self-consistent.
 7. **Re-pack**: re-zip as an `.ipa` with a configurable compression level.
 
 The **main binary** switches to the new bundle id / team and recomputes special slots `-1` (Info) and `-5` (Entitlements). **Embedded binaries** (frameworks / appex) keep their own identifier and special-slot hashes.
@@ -197,7 +213,7 @@ go test ./...   # unit + integration tests
 go vet ./...    # static analysis
 ```
 
-`internal/macho`, `internal/signing`, and `internal/resign` are covered, including Mach-O parsing, CMS round-trip, disk cache, profile parsing, and an end-to-end re-sign flow (with ad-hoc and second-sign cache paths).
+`internal/macho`, `internal/signing`, and `internal/resign` are covered, including Mach-O parsing, CMS round-trip, disk cache, profile parsing, and an end-to-end re-sign flow (with ad-hoc, parallel, and second-sign cache paths). CI (`.github/workflows/ci.yml`) runs the checks above on every push.
 
 ---
 

@@ -17,7 +17,7 @@
 
 `ysign` 是一个用 **纯 Go** 编写的跨平台 iOS 代码签名 / 重签名工具，作为 [zsign](https://github.com/zhlynn/zsign) 的功能平替实现。它不依赖 Xcode，也不依赖 macOS：一条命令即可用你的证书（`.p12` / PEM）与描述文件（`.mobileprovision`）对 `.ipa` 或 `.app` 完成重签名。
 
-核心代码签名栈 **全部自研**：Mach-O（fat / thin）解析、SHA-256 CodeDirectory 重建、以及不依赖第三方库的 CMS / PKCS#7 签名生成（支持 RSA 与 ECDSA）。针对“签名要快”做了按内容寻址的磁盘缓存，23MB / 38 个二进制的整包重签冷签约 **2.4 秒**，缓存命中后更快。
+核心代码签名栈 **全部自研**：Mach-O（fat / thin）解析、SHA-256 CodeDirectory 重建、以及不依赖第三方库的 CMS / PKCS#7 签名生成（支持 RSA 与 ECDSA）。针对“签名要快”，做了 **多线程并行签名**（worker 池按 CPU 数同时处理每个二进制）与按内容寻址的磁盘缓存。23MB / 38 个二进制的整包重签，冷签约 **2.0 秒**，缓存命中约 **1.7 秒**。
 
 ---
 
@@ -36,15 +36,18 @@
 - `-a` adhoc 签名（无证书）
 
 **检查与元数据**
-- `-C` 检查证书 / 描述文件 / 代码签名（含 OCSP 尽力检查）
+- `-C` 检查证书 / 描述文件 / 代码签名（含 OCSP 尽力检查），支持 `.ipa`、`.p12`、`.mobileprovision`、`.cer`、Mach-O
 - `-x` 导出 `metadata.json` 与应用图标
+- `-v` 显示版本，`-d` 保留中间文件便于排查
 
 **清理与打包**
 - `-E` 删除扩展、`-W` 删除 Watch、`-U` 清空 `UISupportedDevices`、`-R` 删除描述文件
 - `-z 0-9` 控制压缩级别，`-o` 指定输出，`-t` 指定临时 / 缓存目录
 
 **性能**
+- **多线程并行签名**：worker 池按 CPU 数同时处理多个二进制，冷签明显提速
 - 按内容寻址的磁盘缓存（页哈希、CMS 签名），`-f` 强制绕过，`-t` 指定缓存目录
+- `-2` 真正强制 SHA-256 CodeDirectory（特殊槽按真实数据重算，对齐 zsign）
 
 ---
 
@@ -69,6 +72,16 @@
 ```bash
 go build -o ysign ./cmd/ysign
 ```
+
+或用 `Makefile` 一键构建 / 交叉编译 / 测试：
+
+```bash
+make build      # 构建当前平台
+make test       # 运行测试
+make release    # 交叉编译 darwin + linux + windows
+```
+
+> 仓库含 GitHub Actions：`ci.yml` 在每次 push 自动跑 `go vet` + `go test`；`release.yml` 在打 `v*` tag 时自动构建 5 个平台的二进制并发布 GitHub Release。
 
 ### 交叉编译（无需目标平台）
 
@@ -100,6 +113,7 @@ ysign -k cert.p12 -p 你的密码 -m dev.mobileprovision -b com.your.app -o sign
   -m, --prov            描述文件路径（可重复，用于扩展）
   -c, --cert            证书文件路径（PEM 或 DER）
   -a, --adhoc           仅 adhoc 签名（无需证书）
+  -d, --debug           保留中间文件并打印工作目录
   -f, --force           强制签名，绕过缓存
   -o, --output          输出 ipa 路径
   -p, --password        私钥或 p12 密码
@@ -114,8 +128,8 @@ ysign -k cert.p12 -p 你的密码 -m dev.mobileprovision -b com.your.app -o sign
   -w, --weak            以 weak 方式注入 dylib（可重复）
   -i, --install         签名后调用 ideviceinstaller 安装
   -t, --temp_folder     临时 / 缓存目录
-  -2, --sha256_only     仅使用 SHA256 code directory
-  -C, --check           检查证书 / 描述文件 / 签名
+  -2, --sha256_only     强制 SHA256-only CodeDirectory（含特殊槽重算）
+  -C, --check           检查证书 / 描述文件 / 签名（支持 ipa）
   -x, --metadata        导出元数据与图标到目录
   -R, --rm_provision    签名后移除描述文件
   -S, --enable_docs     启用 UISupportsDocumentBrowser / UIFileSharingEnabled
@@ -125,6 +139,8 @@ ysign -k cert.p12 -p 你的密码 -m dev.mobileprovision -b com.your.app -o sign
   -U, --rm_uisd         移除 UISupportedDevices
   -P, --inject_extensions 同时向扩展注入 dylib
   -q, --quiet           安静模式
+  -v, --version         显示版本
+  -h, --help            显示帮助
 ```
 
 > 输入可以是 `.ipa`、`.app`，或含 `Payload` 的目录。`.app` 就地签名；`.ipa` 解压到临时目录、签名后重新打包，默认输出 `xxx-ysign.ipa` 到当前目录。
@@ -173,7 +189,7 @@ ysign -x outdir app.ipa
 3. **重建 CodeDirectory**：按原二进制的 hashType / pageSize / version / flags 重建 CD（header → identifier → team → 特殊槽哈希 → 代码页哈希）。
 4. **生成 CMS**：自研 `SignedData`（SHA-256，RSA / ECDSA），eContent 为标准 `[0] EXPLICIT OCTET STRING`，嵌入签名者证书链。
 5. **组装 superblob**：CodeDirectory + Requirements + Entitlements + Signature 槽。
-6. **两遍签名**：第一遍算页哈希得最终尺寸并 patch datasize，第二遍在 patch 后的代码上重算页哈希，保证签名自洽。
+6. **两遍签名 + 并行**：各二进制相互独立，用 worker 池按 CPU 数并行签名；每个二进制内部先算页哈希得最终尺寸并 patch datasize，第二遍在 patch 后的代码上重算页哈希，保证签名自洽。
 7. **重打包**：以可配置压缩级别重新打包为 `.ipa`。
 
 **主二进制**会换用新的 bundle id / team 并重算 `-1`（Info）与 `-5`（Entitlements）特殊槽；**嵌入式二进制**（framework / appex）保留自身标识符与特殊槽哈希。
@@ -197,7 +213,7 @@ go test ./...   # 单元测试 + 集成测试
 go vet ./...    # 静态检查
 ```
 
-`internal/macho`、`internal/signing`、`internal/resign` 均有测试，覆盖 Mach-O 解析、CMS 往返、磁盘缓存、描述文件解析、以及端到端重签名流程（含 adhoc 与二次签名缓存路径）。
+`internal/macho`、`internal/signing`、`internal/resign` 均有测试，覆盖 Mach-O 解析、CMS 往返、磁盘缓存、描述文件解析、以及端到端重签名流程（含 adhoc、并行与二次签名缓存路径）。CI（`.github/workflows/ci.yml`）会在每次 push 自动执行以上检查。
 
 ---
 

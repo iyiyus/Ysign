@@ -1,6 +1,10 @@
 # --- Build artifacts ---
 /ysign.exe
 *.exe
+/ysign
+/ysign-darwin-*
+/ysign-linux-*
+/dist/
 
 # --- Output / test ipa packages ---
 *.ipa
