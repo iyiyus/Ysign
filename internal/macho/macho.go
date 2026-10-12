@@ -230,6 +230,19 @@ func (t *ThinFile) PatchSignatureSize(newSize uint32) error {
 	return errors.New("LC_CODE_SIGNATURE not found")
 }
 
+// PatchSignatureOffset updates the dataoff field of LC_CODE_SIGNATURE in place.
+func (t *ThinFile) PatchSignatureOffset(off uint32) error {
+	for i := range t.LoadCmds {
+		lc := &t.LoadCmds[i]
+		if lc.Cmd == lcCodeSignature && len(lc.Payload) >= 4 {
+			t.Endian.PutUint32(lc.Payload[0:4], off)
+			t.Signature.DataOffset = off
+			return nil
+		}
+	}
+	return errors.New("LC_CODE_SIGNATURE not found")
+}
+
 // Reassemble writes a new binary file from per-slice bytes. For thin binaries
 // it returns slices[0]; for fat binaries it rebuilds the header and arch table.
 func (f *File) Reassemble(slices [][]byte) ([]byte, error) {

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 
 	"ysign/internal/macho"
 	"ysign/internal/signing"
@@ -74,7 +75,7 @@ func rebuildBinary(data []byte, ctx *signContext) ([]byte, error) {
 // rebuildSlice re-signs a single thin image.
 func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 	if thin.Signature == nil {
-		return thin.Data, nil
+		return rebuildUnsignedSlice(thin, ctx)
 	}
 	sb, err := thin.ParseSuperblob()
 	if err != nil {
@@ -373,4 +374,138 @@ func buildSuperblob(cd, req, ent, sig []byte) []byte {
 		off += len(s.b)
 	}
 	return out
+}
+
+// rebuildUnsignedSlice signs a thin image that has no LC_CODE_SIGNATURE at all.
+// It mirrors zsign: write the 16-byte LC_CODE_SIGNATURE into the padding right
+// after the existing load commands (no segment shifting), then append the
+// signature blob at end of file.
+func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
+	headerLen := 32
+	if !thin.Is64 {
+		headerLen = 28
+	}
+	lcEnd := headerLen + int(thin.SizeOfCmds)
+
+	// Work on a mutable copy of the original image.
+	img := make([]byte, len(thin.Data))
+	copy(img, thin.Data)
+
+	// Write LC_CODE_SIGNATURE (linkedit_data_command) at lcEnd.
+	thin.Endian.PutUint32(img[lcEnd:], 0x1d)       // LC_CODE_SIGNATURE
+	thin.Endian.PutUint32(img[lcEnd+4:], 16)       // cmdsize
+	thin.Endian.PutUint32(img[lcEnd+8:], uint32(len(img))) // dataoff = end of code
+	// datasize patched after first blob build.
+
+	// Update ncmds / sizeofcmds in the header.
+	thin.Endian.PutUint32(img[16:20], thin.NCmds+1)
+	thin.Endian.PutUint32(img[20:24], thin.SizeOfCmds+16)
+
+	codeLimit := uint32(len(img))
+
+	// Extract exec-segment bounds from the __TEXT LC_SEGMENT_64.
+	var execBase, execLimit uint64
+	for _, c := range thin.LoadCmds {
+		if c.Cmd != 0x19 && c.Cmd != 0x1 {
+			continue
+		}
+		if len(c.Payload) < 32 {
+			continue
+		}
+		name := string(c.Payload[0:16])
+		if idx := strings.IndexByte(name, 0); idx >= 0 {
+			name = name[:idx]
+		}
+		if name != "__TEXT" {
+			continue
+		}
+		if c.Cmd == 0x19 {
+			execBase = thin.Endian.Uint64(c.Payload[16:24])
+			vmsize := thin.Endian.Uint64(c.Payload[24:32])
+			execLimit = execBase + vmsize
+		} else {
+			execBase = uint64(thin.Endian.Uint32(c.Payload[16:20]))
+			vmsize := uint64(thin.Endian.Uint32(c.Payload[20:24]))
+			execLimit = execBase + vmsize
+		}
+	}
+
+	hashType, hashSize := uint8(0x2), uint8(32) // SHA-256
+	entBlob := signing.BuildEntitlementsBlob(ctx.EntitlementsXML)
+
+	special := make([][]byte, 5)
+	if ctx.SpecialInfoPlist != nil {
+		if h, err := signing.HashBytes(hashType, ctx.SpecialInfoPlist); err == nil {
+			special[0] = h
+		}
+	}
+	if ctx.SpecialCodeResources != nil {
+		if h, err := signing.HashBytes(hashType, ctx.SpecialCodeResources); err == nil {
+			special[2] = h
+		}
+	}
+	if len(entBlob) > 0 {
+		if h, err := signing.HashBytes(hashType, entBlob); err == nil {
+			special[4] = h
+		}
+	}
+	for i := range special {
+		if len(special[i]) == 0 {
+			special[i] = make([]byte, hashSize)
+		}
+	}
+
+	buildPass := func(hashes [][]byte) ([]byte, error) {
+		params := &signing.CodeDirectoryParams{
+			Version:       0x20400,
+			Flags:         0,
+			PageSizeLog:   12,
+			HashType:      hashType,
+			HashSize:      hashSize,
+			Identifier:    ctx.BundleID,
+			TeamID:        ctx.TeamID,
+			CodeLimit:     codeLimit,
+			SpecialHashes: special,
+			CodeHashes:    hashes,
+			ExecSegBase:   execBase,
+			ExecSegLimit:  execLimit,
+			ExecSegFlags:  0,
+		}
+		if ctx.AdHoc {
+			params.Flags |= csFlagAdhoc
+		}
+		return signing.BuildCodeDirectory(img[:codeLimit], params)
+	}
+
+	// Pass 1: provisional blob to learn its size.
+	provHashes := pageHashesCached(ctx, img[:codeLimit], codeLimit, 12, hashType)
+	provCD, err := buildPass(provHashes)
+	if err != nil {
+		return nil, err
+	}
+	provSig, err := buildSignature(provCD, ctx)
+	if err != nil {
+		return nil, err
+	}
+	provBlob := buildSuperblob(provCD, nil, entBlob, provSig)
+
+	// Patch datasize in the LC we just wrote.
+	thin.Endian.PutUint32(img[lcEnd+12:], uint32(len(provBlob)))
+
+	// Pass 2: recompute page hashes over the patched image.
+	hashes := pageHashesCached(ctx, img[:codeLimit], codeLimit, 12, hashType)
+	finalCD, err := buildPass(hashes)
+	if err != nil {
+		return nil, err
+	}
+	finalSig, err := buildSignature(finalCD, ctx)
+	if err != nil {
+		return nil, err
+	}
+	finalBlob := buildSuperblob(finalCD, nil, entBlob, finalSig)
+
+	out := make([]byte, 0, codeLimit+uint32(len(finalBlob)))
+	out = append(out, img[:codeLimit]...)
+	out = append(out, finalBlob...)
+	return out, nil
 }
