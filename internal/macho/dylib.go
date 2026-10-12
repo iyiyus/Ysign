@@ -250,3 +250,12 @@ func adjustSegment(cmd uint32, payload []byte, order binary.ByteOrder, delta int
 		}
 	}
 }
+
+// InjectLoadCommand appends a raw load command (cmd+cmdsize+payload) to a thin
+// image, shifting all subsequent file offsets. Used to add LC_CODE_SIGNATURE to
+// an otherwise unsigned binary.
+func InjectLoadCommand(thin *ThinFile, cmd []byte) ([]byte, error) {
+	return rewriteLoadCommands(thin, func(cmd uint32, payload []byte, order binary.ByteOrder) ([]byte, bool, error) {
+		return nil, true, nil
+	}, cmd)
+}

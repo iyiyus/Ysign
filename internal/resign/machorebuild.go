@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 
 	"ysign/internal/macho"
 	"ysign/internal/signing"
@@ -74,7 +75,7 @@ func rebuildBinary(data []byte, ctx *signContext) ([]byte, error) {
 // rebuildSlice re-signs a single thin image.
 func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 	if thin.Signature == nil {
-		return thin.Data, nil
+		return rebuildUnsignedSlice(thin, ctx)
 	}
 	sb, err := thin.ParseSuperblob()
 	if err != nil {
@@ -373,4 +374,152 @@ func buildSuperblob(cd, req, ent, sig []byte) []byte {
 		off += len(s.b)
 	}
 	return out
+}
+
+// rebuildUnsignedSlice signs a thin image that has no LC_CODE_SIGNATURE at all.
+// It injects the load command, then builds a fresh CodeDirectory + CMS blob.
+func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
+	// 1. Build the 16-byte LC_CODE_SIGNATURE (linkedit_data_command).
+	lc := make([]byte, 16)
+	thin.Endian.PutUint32(lc[0:], 0x1d) // LC_CODE_SIGNATURE
+	thin.Endian.PutUint32(lc[4:], 16)    // cmdsize
+	// dataoff/datasize left as 0 for now; datasize patched after first blob build.
+
+	// 2. Inject the load command, shifting all subsequent file offsets by
+	//    rewriteLoadCommands.
+	injected, err := macho.InjectLoadCommand(thin, lc)
+	if err != nil {
+		return nil, fmt.Errorf("inject LC_CODE_SIGNATURE: %w", err)
+	}
+
+	// 3. Re-parse so thin.Signature is populated.
+	f, err := macho.Parse(injected)
+	if err != nil {
+		return nil, fmt.Errorf("re-parse after inject: %w", err)
+	}
+	if len(f.Slices) != 1 {
+		return nil, errors.New("unexpected slice count after inject")
+	}
+	thin = f.Slices[0]
+
+	// The injected LC_CODE_SIGNATURE currently has dataoff=delta from
+	// adjustOffsets; point it at the end of the image where the blob goes.
+	codeLimit := uint32(len(thin.Data))
+	if err := thin.PatchSignatureOffset(codeLimit); err != nil {
+		return nil, err
+	}
+
+	// Extract exec-segment bounds from the __TEXT LC_SEGMENT_64.
+	var execBase, execLimit uint64
+	for _, c := range thin.LoadCmds {
+		if c.Cmd != 0x19 && c.Cmd != 0x1 { // LC_SEGMENT_64 / LC_SEGMENT
+			continue
+		}
+		if len(c.Payload) < 32 {
+			continue
+		}
+		name := string(c.Payload[0:16])
+		if idx := strings.IndexByte(name, 0); idx >= 0 {
+			name = name[:idx]
+		}
+		if name != "__TEXT" {
+			continue
+		}
+		if c.Cmd == 0x19 {
+			execBase = thin.Endian.Uint64(c.Payload[16:24])
+			vmsize := thin.Endian.Uint64(c.Payload[24:32])
+			execLimit = execBase + vmsize
+		} else {
+			execBase = uint64(thin.Endian.Uint32(c.Payload[16:20]))
+			vmsize := uint64(thin.Endian.Uint32(c.Payload[20:24]))
+			execLimit = execBase + vmsize
+		}
+	}
+
+	hashType, hashSize := uint8(0x2), uint8(32) // SHA-256
+	if !ctx.ForceSHA256 && false {
+		hashType, hashSize = 0x1, 20 // SHA-1
+	}
+
+	entBlob := signing.BuildEntitlementsBlob(ctx.EntitlementsXML)
+
+	// Special slots: -1 Info.plist, -3 CodeResources, -5 entitlements.
+	special := make([][]byte, 5)
+	if ctx.SpecialInfoPlist != nil {
+		if h, err := signing.HashBytes(hashType, ctx.SpecialInfoPlist); err == nil {
+			special[0] = h
+		}
+	}
+	if ctx.SpecialCodeResources != nil {
+		if h, err := signing.HashBytes(hashType, ctx.SpecialCodeResources); err == nil {
+			special[2] = h
+		}
+	}
+	if len(entBlob) > 0 {
+		if h, err := signing.HashBytes(hashType, entBlob); err == nil {
+			special[4] = h
+		}
+	}
+	// Zero-fill any empty special slots to hashSize.
+	for i := range special {
+		if len(special[i]) == 0 {
+			special[i] = make([]byte, hashSize)
+		}
+	}
+
+	buildPass := func(hashes [][]byte) ([]byte, error) {
+		params := &signing.CodeDirectoryParams{
+			Version:       0x20400,
+			Flags:         0,
+			PageSizeLog:   12,
+			HashType:      hashType,
+			HashSize:      hashSize,
+			Identifier:    ctx.BundleID,
+			TeamID:        ctx.TeamID,
+			CodeLimit:     codeLimit,
+			SpecialHashes: special,
+			CodeHashes:    hashes,
+			ExecSegBase:   execBase,
+			ExecSegLimit:  execLimit,
+			ExecSegFlags:  0,
+		}
+		if ctx.AdHoc {
+			params.Flags |= csFlagAdhoc
+		}
+		return signing.BuildCodeDirectory(thin.Data[:codeLimit], params)
+	}
+
+	// Pass 1: provisional blob to learn its size.
+	provHashes := pageHashesCached(ctx, thin.Data[:codeLimit], codeLimit, 12, hashType)
+	provCD, err := buildPass(provHashes)
+	if err != nil {
+		return nil, err
+	}
+	provSig, err := buildSignature(provCD, ctx)
+	if err != nil {
+		return nil, err
+	}
+	provBlob := buildSuperblob(provCD, nil, entBlob, provSig)
+
+	// Patch LC_CODE_SIGNATURE datasize in place.
+	if err := thin.PatchSignatureSize(uint32(len(provBlob))); err != nil {
+		return nil, err
+	}
+
+	// Pass 2: recompute page hashes over the patched image.
+	hashes := pageHashesCached(ctx, thin.Data[:codeLimit], codeLimit, 12, hashType)
+	finalCD, err := buildPass(hashes)
+	if err != nil {
+		return nil, err
+	}
+	finalSig, err := buildSignature(finalCD, ctx)
+	if err != nil {
+		return nil, err
+	}
+	finalBlob := buildSuperblob(finalCD, nil, entBlob, finalSig)
+
+	out := make([]byte, 0, codeLimit+uint32(len(finalBlob)))
+	out = append(out, thin.Data[:codeLimit]...)
+	out = append(out, finalBlob...)
+	return out, nil
 }
