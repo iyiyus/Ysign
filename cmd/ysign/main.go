@@ -21,7 +21,7 @@ import (
 type stringList []string
 
 // version is bumped on releases; it is also injected by the build workflow.
-var version = "1.0.0"
+var version = "1.2.1"
 
 func (s *stringList) String() string { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error {
