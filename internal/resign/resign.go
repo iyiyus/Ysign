@@ -2,6 +2,9 @@
 package resign
 
 import (
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -10,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -296,13 +300,82 @@ func Resign(appDir string, opts *Options) error {
 		return nil
 	}
 
-	// Parallel signing: binaries are independent, so process them with a bounded
-	// worker pool sized to the CPU count. This materially speeds up cold
-	// (cache-less) re-signing of apps with many binaries.
-	if err := parallelFor(len(binaries), func(i int) error {
-		return signOne(binaries[i], isMainBin(binaries[i]))
+	// Split binaries into main executable vs. the rest. The main binary is
+	// signed LAST, after CodeResources has been generated, because the Code
+	// Directory's special slot -3 seals the exact bytes of CodeResources.
+	var mainBin string
+	var others []string
+	for _, b := range binaries {
+		if b == mainPath {
+			mainBin = b
+		} else {
+			others = append(others, b)
+		}
+	}
+
+	// Sign all non-main binaries in parallel.
+	if err := parallelFor(len(others), func(i int) error {
+		return signOne(others[i], false)
 	}); err != nil {
 		return err
+	}
+
+	// Build _CodeSignature/CodeResources: seal hashes of every resource file in
+	// the bundle. This MUST happen after all other binaries are signed (their
+	// bytes are hashed into CodeResources) and BEFORE the main binary is signed
+	// (CodeResources bytes are sealed into the main binary's special slot -3).
+	crData, err := generateCodeResources(appDir, mainName, opts.RemoveProvision)
+	if err != nil {
+		return fmt.Errorf("generate CodeResources: %w", err)
+	}
+	csDir := filepath.Join(appDir, "_CodeSignature")
+	if err := os.MkdirAll(csDir, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(csDir, "CodeResources"), crData, 0o644); err != nil {
+		return err
+	}
+
+	// Sign the main executable last, feeding it the freshly generated
+	// CodeResources bytes for special slot -3.
+	if mainBin != "" {
+		data, err := os.ReadFile(mainBin)
+		if err != nil {
+			return err
+		}
+		for _, d := range opts.InjectDylibs {
+			loadPath := d
+			if isFileDylib[d] {
+				loadPath = "@executable_path/" + filepath.Base(d)
+			}
+			weak := containsString(opts.WeakDylibs, d)
+			data, err = macho.AddLoadDylib(data, loadPath, weak)
+			if err != nil {
+				return fmt.Errorf("inject dylib %s into %s: %w", d, filepath.Base(mainBin), err)
+			}
+		}
+		for _, d := range opts.RemoveDylibs {
+			data, err = macho.RemoveLoadDylib(data, d)
+			if err != nil {
+				return fmt.Errorf("remove dylib %s from %s: %w", d, filepath.Base(mainBin), err)
+			}
+		}
+		ctx := &signContext{
+			BundleID: bundleID, TeamID: teamID, AdHoc: opts.AdHoc, Force: opts.Force,
+			Cache: cache, Signer: opts.Signer, ForceSHA256: opts.ForceSHA256,
+			InfoPlist: infoBytes, EntitlementsXML: entitlementsXML,
+			KeepAllSpecialHashes: false,
+			SpecialInfoPlist:     infoBytes,
+			SpecialCodeResources: crData,
+		}
+		out, err := rebuildBinary(data, ctx)
+		if err != nil {
+			return fmt.Errorf("re-sign %s: %w", filepath.Base(mainBin), err)
+		}
+		if err := os.WriteFile(mainBin, out, 0o755); err != nil {
+			return err
+		}
+		logf(opts, "signed main: %s", filepath.Base(mainBin))
 	}
 	logf(opts, "re-signed %d binary(ies), bundle id=%s team=%s adhoc=%v", len(binaries), bundleID, teamID, opts.AdHoc)
 	return nil
@@ -657,3 +730,166 @@ func isMachO(path string) bool {
 
 // IsMachO exposes the magic check for other packages (e.g. CLI metadata).
 func IsMachO(path string) bool { return isMachO(path) }
+
+// generateCodeResources builds the _CodeSignature/CodeResources XML plist for
+// the given .app bundle, mirroring the layout produced by upstream zsign. It
+// seals the SHA-1/SHA-256 hash of every non-excluded resource file. The caller
+// writes the returned bytes to <app>/_CodeSignature/CodeResources and then
+// re-signs the main binary so special slot -3 seals these exact bytes.
+func generateCodeResources(appDir, mainExe string, removeProvision bool) ([]byte, error) {
+	// Collect all files (relative, slash-separated), sorted for deterministic output.
+	var files []string
+	if err := filepath.WalkDir(appDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(appDir, path)
+		if err != nil {
+			return nil
+		}
+		rel = strings.ReplaceAll(rel, "\\", "/")
+		files = append(files, rel)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	sort.Strings(files)
+
+	// Exclude the seal file itself and the main executable.
+	keep := make([]string, 0, len(files))
+	for _, f := range files {
+		if f == "_CodeSignature/CodeResources" || f == mainExe {
+			continue
+		}
+		keep = append(keep, f)
+	}
+
+	sha1B64 := func(path string) (string, error) {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		s := sha1.Sum(b)
+		return base64.StdEncoding.EncodeToString(s[:]), nil
+	}
+	sha256B64 := func(path string) (string, error) {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		s := sha256.Sum256(b)
+		return base64.StdEncoding.EncodeToString(s[:]), nil
+	}
+
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>files</key>
+	<dict>
+`)
+	for _, rel := range keep {
+		full := filepath.Join(appDir, filepath.FromSlash(rel))
+		// locversion.plist inside any .lproj is omitted entirely.
+		if strings.HasSuffix(rel, ".lproj/locversion.plist") {
+			continue
+		}
+		if removeProvision && rel == "embedded.mobileprovision" {
+			continue
+		}
+		h1, err := sha1B64(full)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(&b, "\t\t<key>%s</key>\n", xmlEscape(rel))
+		if strings.Contains(rel, ".lproj/") {
+			b.WriteString("\t\t<dict>\n")
+			fmt.Fprintf(&b, "\t\t\t<key>hash</key><data>%s</data>\n", h1)
+			b.WriteString("\t\t\t<key>optional</key><true/>\n")
+			b.WriteString("\t\t</dict>\n")
+		} else {
+			fmt.Fprintf(&b, "\t\t<data>%s</data>\n", h1)
+		}
+	}
+	b.WriteString("\t</dict>\n")
+
+	b.WriteString("\t<key>files2</key>\n\t<dict>\n")
+	for _, rel := range keep {
+		full := filepath.Join(appDir, filepath.FromSlash(rel))
+		if strings.HasSuffix(rel, ".lproj/locversion.plist") {
+			continue
+		}
+		// Info.plist, PkgInfo and .DS_Store are sealed only in files (SHA-1), not files2.
+		if rel == "Info.plist" || rel == "PkgInfo" || strings.HasSuffix(rel, ".DS_Store") {
+			continue
+		}
+		if removeProvision && rel == "embedded.mobileprovision" {
+			continue
+		}
+		h1, err := sha1B64(full)
+		if err != nil {
+			return nil, err
+		}
+		h256, err := sha256B64(full)
+		if err != nil {
+			return nil, err
+		}
+		fmt.Fprintf(&b, "\t\t<key>%s</key>\n\t\t<dict>\n", xmlEscape(rel))
+		fmt.Fprintf(&b, "\t\t\t<key>hash</key><data>%s</data>\n", h1)
+		fmt.Fprintf(&b, "\t\t\t<key>hash2</key><data>%s</data>\n", h256)
+		if strings.Contains(rel, ".lproj/") {
+			b.WriteString("\t\t\t<key>optional</key><true/>\n")
+		}
+		b.WriteString("\t\t</dict>\n")
+	}
+	b.WriteString("\t</dict>\n")
+
+	// Fixed rules / rules2 blocks, identical to upstream zsign output.
+	b.WriteString(`	<key>rules</key>
+	<dict>
+		<key>^.*</key><true/>
+		<key>^.*\.lproj/</key>
+		<dict><key>optional</key><true/><key>weight</key><real>1000</real></dict>
+		<key>^.*\.lproj/locversion.plist$</key>
+		<dict><key>omit</key><true/><key>weight</key><real>1100</real></dict>
+		<key>^Base\.lproj/</key>
+		<dict><key>weight</key><real>1010</real></dict>
+		<key>^version.plist$</key><true/>
+	</dict>
+	<key>rules2</key>
+	<dict>
+		<key>.*\.dSYM($|/)</key>
+		<dict><key>weight</key><real>11</real></dict>
+		<key>^(.*/)?\.DS_Store$</key>
+		<dict><key>omit</key><true/><key>weight</key><real>2000</real></dict>
+		<key>^.*</key><true/>
+		<key>^.*\.lproj/</key>
+		<dict><key>optional</key><true/><key>weight</key><real>1000</real></dict>
+		<key>^.*\.lproj/locversion.plist$</key>
+		<dict><key>omit</key><true/><key>weight</key><real>1100</real></dict>
+		<key>^Base\.lproj/</key>
+		<dict><key>weight</key><real>1010</real></dict>
+		<key>^Info\.plist$</key>
+		<dict><key>omit</key><true/><key>weight</key><real>20</real></dict>
+		<key>^PkgInfo$</key>
+		<dict><key>omit</key><true/><key>weight</key><real>20</real></dict>
+		<key>^embedded\.provisionprofile$</key>
+		<dict><key>weight</key><real>20</real></dict>
+		<key>^version\.plist$</key>
+		<dict><key>weight</key><real>20</real></dict>
+	</dict>
+</dict>
+</plist>
+`)
+	return []byte(b.String()), nil
+}
+
+func xmlEscape(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "'", "&apos;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	return s
+}
