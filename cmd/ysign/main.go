@@ -288,7 +288,10 @@ Options:
 		os.Exit(1)
 	}
 	if !q {
-		fmt.Printf("signed and packed: %s\n", out)
+		// Print "Signed OK" for drop-in compatibility with scripts that grep the
+		// output (e.g. PHP strstr($out, "Signed OK")) — this is what most
+		// production sign-portal deployments of zsign rely on.
+		fmt.Printf("Signed OK: %s\n", out)
 	}
 	if install {
 		if err := runInstall(out); err != nil {
