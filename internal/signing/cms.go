@@ -23,6 +23,7 @@ var (
 	oidAttrMessageDigest = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 4}
 	oidAttrSigningTime   = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 9, 5}
 	oidSHA256WithRSA     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 11}
+	oidRSAEncryption     = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 1}
 	oidECDSAWithSHA256   = asn1.ObjectIdentifier{1, 2, 840, 10045, 4, 3, 2}
 )
 
@@ -36,7 +37,9 @@ func sha256Alg() algorithmIdentifier {
 }
 
 func rsaSHA256Alg() algorithmIdentifier {
-	return algorithmIdentifier{Algorithm: oidSHA256WithRSA, Parameters: asn1.RawValue{Tag: 5}}
+	// zsign/OpenSSL emit rsaEncryption (no digest OID) for RSA signer infos;
+	// the digest is carried by DigestAlgorithm.
+	return algorithmIdentifier{Algorithm: oidRSAEncryption, Parameters: asn1.RawValue{Tag: 5}}
 }
 
 func ecdsaSHA256Alg() algorithmIdentifier {
@@ -81,10 +84,21 @@ type attribute struct {
 	Values asn1.RawValue
 }
 
-// BuildCMS constructs an encapsulated CMS SignedData over content (the
-// CodeDirectory blob) using SHA-256 and the given private key (RSA or ECDSA).
-// The signer certificate and any chain certificates are embedded.
+// BuildCMS constructs a DETACHED CMS SignedData over content (the CodeDirectory
+// blob): the eContent is omitted and the CodeDirectory is linked through the
+// messageDigest attribute, matching zsign/OpenSSL CMS_DETACHED. The signer
+// certificate and its Apple chain are embedded.
 func BuildCMS(content []byte, cert *x509.Certificate, chain []*x509.Certificate, priv crypto.Signer) ([]byte, error) {
+	return buildCMS(content, cert, chain, priv, true)
+}
+
+// BuildCMSWithContent constructs a CMS SignedData that EMBEDS content in the
+// eContent field. Used for provisioning profiles and for round-trip tests.
+func BuildCMSWithContent(content []byte, cert *x509.Certificate, chain []*x509.Certificate, priv crypto.Signer) ([]byte, error) {
+	return buildCMS(content, cert, chain, priv, false)
+}
+
+func buildCMS(content []byte, cert *x509.Certificate, chain []*x509.Certificate, priv crypto.Signer, detached bool) ([]byte, error) {
 	digest := sha256.Sum256(content)
 
 	// --- Authenticated attributes (sorted by DER for DER SET semantics) ---
@@ -135,12 +149,22 @@ func BuildCMS(content []byte, cert *x509.Certificate, chain []*x509.Certificate,
 		return nil, err
 	}
 
-	// --- Assemble ---
+	// --- Assemble (detached CMS: eContent is omitted, matching zsign/OpenSSL
+	// CMS_DETACHED; the CodeDirectory is linked via the messageDigest attribute) ---
 	encap := encapsulatedContentInfo{
 		ContentType: oidData,
-		Content:     content,
 	}
-	allCerts := append([]*x509.Certificate{cert}, chain...)
+	if !detached {
+		encap.Content = content
+	}
+	// Build the Apple chain: the WWDR intermediate that issued cert, plus the
+	// root CA that issued that intermediate. Prefer the p12's own chain only
+	// when it actually contains the leaf's issuer.
+	inter, root, err := AppleChainForLeaf(cert)
+	if err != nil {
+		return nil, err
+	}
+	allCerts := []*x509.Certificate{inter, root, cert}
 	certSet := make([]byte, 0, len(allCerts)*512)
 	for _, c := range allCerts {
 		if c != nil {

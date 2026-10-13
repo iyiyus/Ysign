@@ -62,8 +62,8 @@ type CodeDirectory struct {
 	HashType      uint8
 	Platform      uint8
 	PageSize      uint8 // stored as log2(page size)
-	ScatterOffset uint8
-	TeamOffset    uint8
+	ScatterOffset uint32
+	TeamOffset    uint32
 
 	// Raw blob bytes for hashing/reconstruction.
 	Raw []byte
@@ -212,8 +212,8 @@ func ParseCodeDirectory(order binary.ByteOrder, raw []byte) (*CodeDirectory, err
 		HashType:      raw[37],
 		Platform:      raw[38],
 		PageSize:      raw[39],
-		ScatterOffset: raw[41],
-		TeamOffset:    raw[42],
+		ScatterOffset: be.Uint32(raw[44:48]),
+		TeamOffset:    be.Uint32(raw[48:52]),
 		Raw:           raw,
 	}
 	if int(cd.Length) > len(raw) {
@@ -237,33 +237,45 @@ func ParseCodeDirectory(order binary.ByteOrder, raw []byte) (*CodeDirectory, err
 }
 
 // SpecialSlotIndex maps a special slot number (-1..-6) to its index in the
-// special-slot hash array stored inside the CodeDirectory.
+// special-slot hash array stored inside the CodeDirectory. Index 0 is the
+// lowest Apple slot (Info.plist, slot 1); the array is stored in Apple slot
+// order, so index = appleSlot - 1.
 func SpecialSlotIndex(slotNumber int) int {
 	return -slotNumber - 1
 }
 
 // SpecialSlotHash returns the raw hash (of HashSize bytes) for a special slot
-// number (e.g. -1 for Info.plist, -2 for requirements, -5 for entitlements).
+// number (e.g. -1 for Info.plist, -2 for requirements, -5 for entitlements,
+// -7 for DER entitlements). Apple stores the special-slot block immediately
+// BEFORE the code-hash block: HashOffset points at the code hashes, and the
+// special slots run from HashOffset - nSpecialSlots*hashSize (highest slot)
+// down to HashOffset - hashSize (slot 1, Info.plist).
 // Returns nil if the slot is out of range.
 func (cd *CodeDirectory) SpecialSlotHash(slotNumber int) []byte {
 	idx := SpecialSlotIndex(slotNumber)
 	if idx < 0 || idx >= int(cd.NSpecialSlots) {
 		return nil
 	}
-	base := int(cd.HashOffset) + idx*int(cd.HashSize)
+	appleSlot := idx + 1 // 1..nSpecialSlots
+	base := int(cd.HashOffset) - appleSlot*int(cd.HashSize)
+	if base < int(cd.IdentOffset) {
+		return nil
+	}
 	end := base + int(cd.HashSize)
-	if end > len(cd.Raw) {
+	if end > int(cd.HashOffset) || end > len(cd.Raw) {
 		return nil
 	}
 	return cd.Raw[base:end]
 }
 
-// CodeSlotHash returns the hash for a code page slot (>=0).
+// CodeSlotHash returns the hash for a code page slot (>=0). Code hashes start
+// exactly at HashOffset (Apple semantics: hashOffset points at the code-hash
+// block, unlike the special-slot block which precedes it).
 func (cd *CodeDirectory) CodeSlotHash(slot int) []byte {
 	if slot < 0 || slot >= int(cd.NCodeSlots) {
 		return nil
 	}
-	base := int(cd.HashOffset) + int(cd.NSpecialSlots)*int(cd.HashSize) + slot*int(cd.HashSize)
+	base := int(cd.HashOffset) + slot*int(cd.HashSize)
 	end := base + int(cd.HashSize)
 	if end > len(cd.Raw) {
 		return nil

@@ -567,19 +567,8 @@ func resolveEntitlements(opts *Options, provision *signing.Provision, appDir, bu
 	}
 	if provision != nil && provision.Entitlements != nil {
 		ent := cloneMap(provision.Entitlements)
-		prefix := provision.AppIDPrefix()
-		if prefix == "" {
-			prefix = teamID
-		}
-		if bundleID != "" {
-			ent["application-identifier"] = prefix + "." + bundleID
-			ent["com.apple.developer.team-identifier"] = teamID
-			if groups, ok := ent["keychain-access-groups"]; ok {
-				if arr, ok2 := groups.([]interface{}); ok2 && len(arr) > 0 {
-					ent["keychain-access-groups"] = []interface{}{prefix + "." + bundleID}
-				}
-			}
-		}
+		// Match zsign: use profile entitlements verbatim, do NOT rewrite
+		// application-identifier / keychain-access-groups from bundleID.
 		return plistutil.EncodeXML(ent)
 	}
 	// Adhoc or no profile: keep existing entitlements, else empty.

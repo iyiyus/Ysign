@@ -89,7 +89,7 @@ func selfSignedCert(t *testing.T) (*x509.Certificate, *rsa.PrivateKey) {
 func TestCMSRoundTrip(t *testing.T) {
 	cert, key := selfSignedCert(t)
 	content := []byte("hello code directory")
-	out, err := signing.BuildCMS(content, cert, nil, key)
+	out, err := signing.BuildCMSWithContent(content, cert, nil, key)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,6 +99,19 @@ func TestCMSRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got, content) {
 		t.Fatalf("content mismatch")
+	}
+	// The production signature path is detached: no eContent, but the
+	// messageDigest attribute still links the CodeDirectory.
+	det, err := signing.BuildCMS(content, cert, nil, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ec, err := signing.ParseCMSContent(det)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ec) != 0 {
+		t.Fatalf("detached CMS should have no eContent, got %d bytes", len(ec))
 	}
 }
 
@@ -150,7 +163,7 @@ func TestParseProvision(t *testing.T) {
 		<key>application-identifier</key><string>TEAMPREFIX.com.example.test</string>
 	</dict>
 </dict></plist>`)
-	der, err := signing.BuildCMS(plist, cert, nil, key)
+	der, err := signing.BuildCMSWithContent(plist, cert, nil, key)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"ysign/internal/macho"
@@ -14,10 +15,11 @@ const (
 	csMagicEmbeddedSignature = 0xfade0cc0
 	csMagicBlobWrapper       = 0xfade0b01
 
-	slotCodeDirectory = 0
-	slotRequirements  = 2
-	slotEntitlements  = 5
-	slotSignature     = 0x10000
+	slotCodeDirectory    = 0
+	slotRequirements     = 2
+	slotEntitlements     = 5
+	slotDerEntitlements  = 7
+	slotSignature        = 0x10000
 
 	csFlagAdhoc           = 0x0002
 	csFlagHardenedRuntime = 0x10000
@@ -184,7 +186,7 @@ func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	blob1 := buildSuperblob(provCD, reqBlob, entBlob, sig1)
+	blob1 := buildSuperblob(provCD, reqBlob, entBlob, nil, sig1)
 	finalSize := len(blob1)
 
 	// Patch the LC_CODE_SIGNATURE datasize (this changes the hashed code bytes).
@@ -203,7 +205,7 @@ func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	blob2 := buildSuperblob(finalCD, reqBlob, entBlob, sig2)
+	blob2 := buildSuperblob(finalCD, reqBlob, entBlob, nil, sig2)
 
 	out := make([]byte, 0, len(code)+len(blob2))
 	out = append(out, code...)
@@ -333,7 +335,7 @@ func certID(s *signing.Signer) string {
 }
 
 // buildSuperblob assembles a CSMAGIC_EMBEDDED_SIGNATURE blob from slots.
-func buildSuperblob(cd, req, ent, sig []byte) []byte {
+func buildSuperblob(cd, req, ent, derEnt, sig []byte) []byte {
 	type slot struct {
 		typ uint32
 		b   []byte
@@ -347,6 +349,9 @@ func buildSuperblob(cd, req, ent, sig []byte) []byte {
 	}
 	if ent != nil {
 		slots = append(slots, slot{slotEntitlements, ent})
+	}
+	if derEnt != nil {
+		slots = append(slots, slot{slotDerEntitlements, derEnt})
 	}
 	if sig != nil {
 		slots = append(slots, slot{slotSignature, sig})
@@ -404,6 +409,8 @@ func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error
 	codeLimit := uint32(len(img))
 
 	// Extract exec-segment bounds from the __TEXT LC_SEGMENT_64.
+	// zsign writes execSegBase=0 and execSegLimit=__TEXT vmsize; follow that
+	// exactly so the CodeDirectory matches what zsign produces.
 	var execBase, execLimit uint64
 	for _, c := range thin.LoadCmds {
 		if c.Cmd != 0x19 && c.Cmd != 0x1 {
@@ -420,38 +427,73 @@ func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error
 			continue
 		}
 		if c.Cmd == 0x19 {
-			execBase = thin.Endian.Uint64(c.Payload[16:24])
 			vmsize := thin.Endian.Uint64(c.Payload[24:32])
-			execLimit = execBase + vmsize
+			execLimit = vmsize
 		} else {
-			execBase = uint64(thin.Endian.Uint32(c.Payload[16:20]))
 			vmsize := uint64(thin.Endian.Uint32(c.Payload[20:24]))
-			execLimit = execBase + vmsize
+			execLimit = vmsize
 		}
+		execBase = 0
+		break
 	}
 
 	hashType, hashSize := uint8(0x2), uint8(32) // SHA-256
+	isExecutable := thin.FileType == 2 // MH_EXECUTE
 	entBlob := signing.BuildEntitlementsBlob(ctx.EntitlementsXML)
+	derEntBlob := signing.BuildDerEntitlementsBlob(ctx.EntitlementsXML)
+	reqBlob := signing.StandardRequirementsBlob
 
-	special := make([][]byte, 5)
+	// Special hashes are indexed by CSSLOT type:
+	//   1=Info.plist, 2=Requirements, 3=CodeResources, 5=XML Entitlements, 7=DER Entitlements
+	special := make([][]byte, 8)
 	if ctx.SpecialInfoPlist != nil {
 		if h, err := signing.HashBytes(hashType, ctx.SpecialInfoPlist); err == nil {
-			special[0] = h
+			special[1] = h
+		}
+	}
+	if len(reqBlob) > 0 {
+		if h, err := signing.HashBytes(hashType, reqBlob); err == nil {
+			special[2] = h
 		}
 	}
 	if ctx.SpecialCodeResources != nil {
 		if h, err := signing.HashBytes(hashType, ctx.SpecialCodeResources); err == nil {
-			special[2] = h
+			special[3] = h
 		}
 	}
 	if len(entBlob) > 0 {
 		if h, err := signing.HashBytes(hashType, entBlob); err == nil {
-			special[4] = h
+			special[5] = h
+		}
+	}
+	if len(derEntBlob) > 0 {
+		if h, err := signing.HashBytes(hashType, derEntBlob); err == nil {
+			special[7] = h
 		}
 	}
 	for i := range special {
 		if len(special[i]) == 0 {
 			special[i] = make([]byte, hashSize)
+		}
+	}
+	// Match zsign: trim trailing (high-index) empty special slots, keeping
+	// slots 1..H where H is the highest slot that carries a real hash.
+	// Empty slots between 1 and H (e.g. 4, 6) stay as zero hashes.
+	high := 1
+	for i := 7; i >= 1; i-- {
+		if !allZero(special[i]) {
+			high = i
+			break
+		}
+	}
+	special = special[1 : high+1]
+
+	// execSegFlags: main binary flag + ALLOW_UNSIGNED when get-task-allow.
+	execFlags := uint64(0)
+	if isExecutable {
+		execFlags |= 0x1 // CS_EXECSEG_MAIN_BINARY
+		if hasGetTaskAllow(ctx.EntitlementsXML) {
+			execFlags |= 0x10 // CS_EXECSEG_ALLOW_UNSIGNED
 		}
 	}
 
@@ -469,7 +511,7 @@ func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error
 			CodeHashes:    hashes,
 			ExecSegBase:   execBase,
 			ExecSegLimit:  execLimit,
-			ExecSegFlags:  0,
+			ExecSegFlags:  execFlags,
 		}
 		if ctx.AdHoc {
 			params.Flags |= csFlagAdhoc
@@ -487,10 +529,34 @@ func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	provBlob := buildSuperblob(provCD, nil, entBlob, provSig)
+	provBlob := buildSuperblob(provCD, reqBlob, entBlob, derEntBlob, provSig)
 
 	// Patch datasize in the LC we just wrote.
 	thin.Endian.PutUint32(img[lcEnd+12:], uint32(len(provBlob)))
+
+	// Extend __LINKEDIT segment vmsize/filesize by the blob size, matching
+	// zsign. iOS requires the signature blob to live inside __LINKEDIT.
+	off := headerLen
+	for _, c := range thin.LoadCmds {
+		if c.Cmd == 0x19 && len(c.Payload) >= 48 {
+			name := string(c.Payload[0:16])
+			if idx := strings.IndexByte(name, 0); idx >= 0 {
+				name = name[:idx]
+			}
+			if name == "__LINKEDIT" {
+				vm := thin.Endian.Uint64(c.Payload[24:32])
+				fs := thin.Endian.Uint64(c.Payload[40:48])
+				fmt.Fprintf(os.Stderr, "[dbg] __LINKEDIT off=%d vmsize=%d filesize=%d blob=%d\n", off, vm, fs, len(provBlob))
+				fsAfter := fs + uint64(len(provBlob))
+				const pageSize = 4096
+				vmAfter := (fsAfter + pageSize - 1) &^ (pageSize - 1)
+				fmt.Fprintf(os.Stderr, "[dbg] fsAfter=%d vmAfter=%d\n", fsAfter, vmAfter)
+				thin.Endian.PutUint64(img[off+8+24:], vmAfter)
+				thin.Endian.PutUint64(img[off+8+40:], fsAfter)
+			}
+		}
+		off += int(c.Size)
+	}
 
 	// Pass 2: recompute page hashes over the patched image.
 	hashes := pageHashesCached(ctx, img[:codeLimit], codeLimit, 12, hashType)
@@ -502,10 +568,42 @@ func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
-	finalBlob := buildSuperblob(finalCD, nil, entBlob, finalSig)
+	finalBlob := buildSuperblob(finalCD, reqBlob, entBlob, derEntBlob, finalSig)
 
 	out := make([]byte, 0, codeLimit+uint32(len(finalBlob)))
 	out = append(out, img[:codeLimit]...)
 	out = append(out, finalBlob...)
 	return out, nil
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// hasGetTaskAllow reports whether the XML entitlements contain
+// <key>get-task-allow</key> followed by <true /> (development builds).
+func hasGetTaskAllow(xml []byte) bool {
+	if len(xml) == 0 {
+		return false
+	}
+	s := string(xml)
+	i := strings.Index(s, "<key>get-task-allow</key>")
+	if i < 0 {
+		return false
+	}
+	after := s[i:]
+	ti := strings.Index(after, "<true")
+	fi := strings.Index(after, "<false")
+	if ti < 0 {
+		return false
+	}
+	if fi >= 0 && fi < ti {
+		return false
+	}
+	return true
 }

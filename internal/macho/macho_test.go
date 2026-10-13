@@ -14,10 +14,10 @@ func buildSyntheticThin(t *testing.T) []byte {
 	const headerLen = 32
 	lcSize := 16
 
-	// --- CodeDirectory (v2) ---
+	// --- CodeDirectory (0x20200: scatterOffset + teamOffset) ---
 	ident := "com.example.test"
 	team := "ABCDE12345"
-	headerLenCD := 44
+	headerLenCD := 52 // 44 base + scatter(4) + team(4)
 	identOffset := headerLenCD
 	teamOffset := headerLenCD + len(ident) + 1
 	hashOffset := teamOffset + len(team) + 1
@@ -29,8 +29,11 @@ func buildSyntheticThin(t *testing.T) []byte {
 	be := binary.BigEndian
 	be.PutUint32(cd[0:], 0xfade0c02)
 	be.PutUint32(cd[4:], uint32(cdLen))
-	be.PutUint32(cd[8:], 0x20000)
-	be.PutUint32(cd[16:], uint32(hashOffset))
+	be.PutUint32(cd[8:], 0x20200)
+	// Apple semantics: the hashOffset field points at the CODE-hash block;
+	// the special-slot block (nSpecialSlots * hashSize) precedes it.
+	codeHashOffset := hashOffset + nSpecial*hashSize
+	be.PutUint32(cd[16:], uint32(codeHashOffset))
 	be.PutUint32(cd[20:], uint32(identOffset))
 	be.PutUint32(cd[24:], uint32(nSpecial))
 	be.PutUint32(cd[28:], uint32(nCode))
@@ -38,14 +41,14 @@ func buildSyntheticThin(t *testing.T) []byte {
 	cd[36] = byte(hashSize)
 	cd[37] = 2 // sha256
 	cd[39] = 12
-	cd[42] = byte(teamOffset)
+	be.PutUint32(cd[44:], 0)                   // scatterOffset
+	be.PutUint32(cd[48:], uint32(teamOffset))  // teamOffset
 	copy(cd[identOffset:], ident)
 	copy(cd[teamOffset:], team)
 	// hashes filled with deterministic bytes
 	for i := int(hashOffset); i < cdLen; i++ {
 		cd[i] = byte(i)
 	}
-
 	// --- blob wrapper signature (dummy CMS) ---
 	cms := []byte{0x30, 0x03, 0x02, 0x01, 0x01} // minimal DER
 	sigBlob := make([]byte, 8+len(cms))
@@ -125,6 +128,7 @@ func TestParseSyntheticThin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("debug: version=%#x teamOff=%d hashOff=%d identOff=%d len=%d raw48=%x", cd.Version, cd.TeamOffset, cd.HashOffset, cd.IdentOffset, len(cd.Raw), cd.Raw[48:56])
 	if cd.Identifier != "com.example.test" {
 		t.Fatalf("identifier=%q", cd.Identifier)
 	}

@@ -24,21 +24,25 @@ func buildSyntheticMachO(t *testing.T, ident, team string) []byte {
 	const headerLen = 32
 	lcSize := 16
 
-	// v3 CodeDirectory.
-	headerLenCD := 76
+	// v3 CodeDirectory (0x20400): 44 base + scatter(4) + team(4) + spare3/
+	// codeLimit64(12) + execSeg(24) = 88-byte header.
+	headerLenCD := 88
 	identOffset := headerLenCD
 	teamOffset := headerLenCD + len(ident) + 1
-	hashOffset := teamOffset + len(team) + 1
+	hashOffset := teamOffset + len(team) + 1 // special-slot block start
 	nSpecial, nCode := 5, 1
 	hashSize := 32
-	cdLen := int(hashOffset) + (nSpecial+nCode)*hashSize
+	// Apple semantics: the hashOffset field points at the CODE-hash block;
+	// the special-slot block (nSpecialSlots*hashSize) precedes it.
+	codeHashOffset := hashOffset + nSpecial*hashSize
+	cdLen := int(codeHashOffset) + nCode*hashSize
 	cd := make([]byte, cdLen)
-	o := binary.LittleEndian
 	be := binary.BigEndian
+	o := binary.LittleEndian
 	be.PutUint32(cd[0:], 0xfade0c02)
 	be.PutUint32(cd[4:], uint32(cdLen))
 	be.PutUint32(cd[8:], 0x20400)
-	be.PutUint32(cd[16:], uint32(hashOffset))
+	be.PutUint32(cd[16:], uint32(codeHashOffset))
 	be.PutUint32(cd[20:], uint32(identOffset))
 	be.PutUint32(cd[24:], uint32(nSpecial))
 	be.PutUint32(cd[28:], uint32(nCode))
@@ -46,9 +50,10 @@ func buildSyntheticMachO(t *testing.T, ident, team string) []byte {
 	cd[36] = byte(hashSize)
 	cd[37] = 2
 	cd[39] = 12
-	cd[42] = byte(teamOffset)
-	o.PutUint64(cd[52:], 0x100000000)
-	o.PutUint64(cd[60:], 0x4000)
+	be.PutUint32(cd[44:], 0) // scatterOffset
+	be.PutUint32(cd[48:], uint32(teamOffset))
+	be.PutUint64(cd[64:], 0x100000000) // execSegBase
+	be.PutUint64(cd[72:], 0x4000)      // execSegLimit
 	copy(cd[identOffset:], ident)
 	copy(cd[teamOffset:], team)
 	for i := int(hashOffset); i < cdLen; i++ {
@@ -192,12 +197,11 @@ func TestResignEndToEnd(t *testing.T) {
 		t.Fatalf("expected CMS signature, err=%v", err)
 	}
 	// The signature should be a real CMS (signer present) since Signer set.
-	content, err := signing.ParseCMSContent(sig)
-	if err != nil {
+	// Production signature is detached (zsign/OpenSSL CMS_DETACHED): the
+	// CodeDirectory is linked through the messageDigest attribute, so the
+	// eContent is intentionally empty.
+	if _, err := signing.ParseCMSContent(sig); err != nil {
 		t.Fatalf("CMS not parseable: %v", err)
-	}
-	if len(content) == 0 {
-		t.Fatal("CMS content empty")
 	}
 
 	// Re-signing again must succeed (cache path).

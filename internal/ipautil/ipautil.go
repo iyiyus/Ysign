@@ -124,8 +124,19 @@ func ZipDir(rootDir, outZip string, level int) error {
 		hdr.Name = rel
 		if info.IsDir() {
 			hdr.Name = rel
+			hdr.SetMode(0755 | os.ModeDir)
 		} else {
 			hdr.Method = zip.Deflate
+			// Match iOS expectations: main executable is 0755, others 0644.
+			// Go's zip.FileInfoHeader on Windows produces 0666, which iOS rejects.
+			base := filepath.Base(rel)
+			ext := filepath.Ext(base)
+			// Main executable: no extension, directly inside .app, and not PkgInfo
+			if ext == "" && strings.HasSuffix(rel, ".app/"+base) && base != "PkgInfo" && base != "SignedByEsign" {
+				hdr.SetMode(0755)
+			} else {
+				hdr.SetMode(0644)
+			}
 		}
 		w, err := zw.CreateHeader(hdr)
 		if err != nil {

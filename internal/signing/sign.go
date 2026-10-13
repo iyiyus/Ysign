@@ -6,12 +6,15 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"howett.net/plist"
+	"sort"
 )
 
 // Code signature blob magics and slots (mirror of macho package constants).
 const (
 	csMagicCodeDirectory        = 0xfade0c02
 	csMagicEmbeddedEntitlements = 0xfade7171
+	csMagicDerEntitlements      = 0xfade7172
 	csMagicRequirements         = 0xfade0c01
 	csMagicEmbeddedSignature    = 0xfade0cc0
 	csMagicBlobWrapper          = 0xfade0b01
@@ -70,9 +73,35 @@ type CodeDirectoryParams struct {
 // PageBytes returns the code page size in bytes.
 func (p *CodeDirectoryParams) PageBytes() int { return 1 << p.PageSizeLog }
 
-// BuildCodeDirectory constructs the CodeDirectory blob, laying out
-// header -> identifier -> team -> hashes (special then code) so that the
-// team offset stays within a single byte, matching Apple's codesign.
+// BuildCodeDirectory constructs the CodeDirectory blob with the standard
+// Apple layout for version 0x20400 (88-byte header):
+//
+//	0   magic
+//	4   length
+//	8   version
+//	12  flags
+//	16  hashOffset
+//	20  identOffset
+//	24  nSpecialSlots
+//	28  nCodeSlots
+//	32  codeLimit
+//	36  hashSize
+//	37  hashType
+//	38  platform
+//	39  pageSize (log2)
+//	40  spare2 (4)
+//	44  scatterOffset (4)
+//	48  teamOffset (4)
+//	52  spare3 (4)
+//	56  codeLimit64 (8)
+//	64  execSegBase (8)
+//	72  execSegLimit (8)
+//	80  execSegFlags (8)
+//	88  identifier\0 team\0 special hashes code hashes
+//
+// Special hashes are written from the highest slot index down to 1 so that
+// the slot -1 hash (Info.plist) ends up immediately before the code hashes,
+// matching Apple codesign and zsign.
 func BuildCodeDirectory(content []byte, p *CodeDirectoryParams) ([]byte, error) {
 	if p.PageSizeLog == 0 {
 		return nil, errors.New("pageSize must not be zero")
@@ -82,17 +111,31 @@ func BuildCodeDirectory(content []byte, p *CodeDirectoryParams) ([]byte, error) 
 		return nil, fmt.Errorf("codeLimit %d exceeds content %d", p.CodeLimit, len(content))
 	}
 	headerLen := 44
-	if p.Version >= cdVersion3 {
-		headerLen = 76
+	if p.Version >= cdVersion2 {
+		headerLen += 4 // scatterOffset
+	}
+	if p.Version >= 0x20200 {
+		headerLen += 4 // teamOffset
+	}
+	if p.Version >= 0x20300 {
+		headerLen += 4 + 8 // spare3 + codeLimit64
+	}
+	if p.Version >= 0x20400 {
+		headerLen += 8 + 8 + 8 // execSegBase + execSegLimit + execSegFlags
 	}
 	nCodeSlots := (int(p.CodeLimit) + pageBytes - 1) / pageBytes
 	if nCodeSlots == 0 {
 		nCodeSlots = 1
 	}
 	identOffset := uint32(headerLen)
-	teamOffset := identOffset + uint32(len(p.Identifier)+1)
-	hashOffset := teamOffset + uint32(len(p.TeamID)+1)
-	total := int(hashOffset) + (len(p.SpecialHashes)+nCodeSlots)*int(p.HashSize)
+	teamOffset := uint32(0)
+	hashOffset := identOffset + uint32(len(p.Identifier)+1)
+	if p.TeamID != "" {
+		teamOffset = hashOffset
+		hashOffset += uint32(len(p.TeamID) + 1)
+	}
+	hashOffset += uint32(len(p.SpecialHashes)) * uint32(p.HashSize)
+	total := int(hashOffset) + nCodeSlots*int(p.HashSize)
 
 	buf := make([]byte, total)
 	order := binary.BigEndian // code signature blobs are always big-endian
@@ -110,34 +153,37 @@ func BuildCodeDirectory(content []byte, p *CodeDirectoryParams) ([]byte, error) 
 	buf[38] = p.Platform
 	buf[39] = p.PageSizeLog
 	buf[40] = 0 // spare2
-	if p.Version >= cdVersion2 {
-		buf[41] = 0 // scatterOffset
-		buf[42] = byte(teamOffset)
-		buf[43] = 0 // spare3
+	order.PutUint32(buf[44:], 0) // scatterOffset
+	order.PutUint32(buf[48:], teamOffset)
+	order.PutUint32(buf[52:], 0) // spare3
+	if p.Version >= 0x20300 {
+		order.PutUint64(buf[56:], 0) // codeLimit64 (zsign leaves it 0)
 	}
-	if p.Version >= cdVersion3 {
-		order.PutUint64(buf[44:], uint64(p.CodeLimit))
-		order.PutUint64(buf[52:], p.ExecSegBase)
-		order.PutUint64(buf[60:], p.ExecSegLimit)
-		order.PutUint64(buf[68:], p.ExecSegFlags)
+	if p.Version >= 0x20400 {
+		order.PutUint64(buf[64:], p.ExecSegBase)
+		order.PutUint64(buf[72:], p.ExecSegLimit)
+		order.PutUint64(buf[80:], p.ExecSegFlags)
 	}
 
 	// identifier + team strings.
 	pos := headerLen
 	copy(buf[pos:], p.Identifier)
 	pos += len(p.Identifier) + 1
-	copy(buf[pos:], p.TeamID)
-	pos += len(p.TeamID) + 1
+	if p.TeamID != "" {
+		copy(buf[pos:], p.TeamID)
+		pos += len(p.TeamID) + 1
+	}
 
-	// special slot hashes.
-	for _, h := range p.SpecialHashes {
+	// Special slot hashes, written from the highest slot index down to 1.
+	for i := len(p.SpecialHashes) - 1; i >= 0; i-- {
+		h := p.SpecialHashes[i]
 		if len(h) != int(p.HashSize) {
 			return nil, fmt.Errorf("special slot hash has %d bytes, want %d", len(h), p.HashSize)
 		}
 		copy(buf[pos:], h)
 		pos += int(p.HashSize)
 	}
-	// code page hashes.
+	// Code page hashes.
 	for i := 0; i < nCodeSlots; i++ {
 		var h []byte
 		if p.CodeHashes != nil && i < len(p.CodeHashes) {
@@ -194,4 +240,109 @@ func BuildEntitlementsBlob(plistXML []byte) []byte {
 	binary.BigEndian.PutUint32(out[4:], uint32(len(out)))
 	copy(out[8:], plistXML)
 	return out
+}
+
+// BuildDerEntitlementsBlob converts the XML entitlements plist into the Apple
+// DER-encoded plist form (slot 7, magic 0xfade7172). Modern iOS requires this
+// slot in addition to slot 5; the payload must be ASN.1 DER (SET OF entries),
+// NOT a binary plist, or installd fails to parse entitlements.
+func BuildDerEntitlementsBlob(plistXML []byte) []byte {
+	var v map[string]interface{}
+	if err := plistUnmarshalXML(plistXML, &v); err != nil {
+		return nil
+	}
+	der := derEncodePlistValue(v)
+	if len(der) == 0 {
+		return nil
+	}
+	out := make([]byte, 8+len(der))
+	binary.BigEndian.PutUint32(out[0:], csMagicDerEntitlements)
+	binary.BigEndian.PutUint32(out[4:], uint32(len(out)))
+	copy(out[8:], der)
+	return out
+}
+
+func derEncodePlistValue(v interface{}) []byte {
+	switch x := v.(type) {
+	case string:
+		return derTLV(0x0c, []byte(x))
+	case bool:
+		if x {
+			return []byte{0x01, 0x01, 0xff}
+		}
+		return []byte{0x01, 0x01, 0x00}
+	case uint64:
+		return derInteger(x)
+	case int64:
+		return derInteger(uint64(x))
+	case int:
+		return derInteger(uint64(x))
+	case []byte:
+		return derTLV(0x04, x)
+	case []interface{}:
+		var body []byte
+		for _, e := range x {
+			body = append(body, derEncodePlistValue(e)...)
+		}
+		return derTLV(0x30, body)
+	case map[string]interface{}:
+		// dict -> SET (0x31) OF SEQUENCE { key UTF8String, value }
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var body []byte
+		for _, k := range keys {
+			entry := append(derTLV(0x0c, []byte(k)), derEncodePlistValue(x[k])...)
+			body = append(body, derTLV(0x30, entry)...)
+		}
+		return derTLV(0x31, body)
+	}
+	return nil
+}
+
+func derTLV(tag byte, content []byte) []byte {
+	out := []byte{tag}
+	out = append(out, derLength(len(content))...)
+	return append(out, content...)
+}
+
+func derLength(n int) []byte {
+	if n < 0x80 {
+		return []byte{byte(n)}
+	}
+	var tmp [8]byte
+	i := len(tmp)
+	for n > 0 {
+		i--
+		tmp[i] = byte(n)
+		n >>= 8
+	}
+	out := []byte{0x80 | byte(len(tmp)-i)}
+	return append(out, tmp[i:]...)
+}
+
+func derInteger(u uint64) []byte {
+	if u == 0 {
+		return []byte{0x02, 0x01, 0x00}
+	}
+	var tmp [8]byte
+	i := len(tmp)
+	for u > 0 {
+		i--
+		tmp[i] = byte(u)
+		u >>= 8
+	}
+	body := tmp[i:]
+	// prepend 0x00 to keep the value positive
+	if body[0]&0x80 != 0 {
+		body = append([]byte{0x00}, body...)
+	}
+	return derTLV(0x02, body)
+}
+
+func plistUnmarshalXML(data []byte, v interface{}) error {
+	_, err := plist.Unmarshal(data, v)
+	return err
 }
