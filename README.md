@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="logo2.jpg" alt="ysign logo" width="140" />
+
 # ysign
 
 **纯 Go 编写的跨平台 iOS 代码签名 / 重签名工具 · 对标 zsign 的功能平替**

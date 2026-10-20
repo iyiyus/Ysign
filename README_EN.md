@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="logo2.jpg" alt="ysign logo" width="140" />
+
 # ysign
 
 **A fast, cross-platform iOS code signing / re-signing tool written in pure Go — a drop-in, zsign-compatible alternative.**

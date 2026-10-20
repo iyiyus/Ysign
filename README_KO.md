@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="logo2.jpg" alt="ysign logo" width="140" />
+
 # ysign
 
 **순수 Go로 작성된 크로스플랫폼 iOS 코드 서명 / 재서명 도구 — zsign 호환 기능 대체**
