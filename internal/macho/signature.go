@@ -40,11 +40,15 @@ const (
 	hashSHA384     = 4
 )
 
-// CodeDirectory version constants.
+// CodeDirectory version constants. Each version adds trailing fields to the
+// fixed header (see the layout comment on signing.BuildCodeDirectory).
 const (
-	cdVersion1 = 0x10000
-	cdVersion2 = 0x20000
-	cdVersion3 = 0x20400
+	cdVersion1     = 0x10000
+	cdVersion2     = 0x20000
+	cdVersion20100 = 0x20100 // + scatterOffset
+	cdVersion20200 = 0x20200 // + teamOffset
+	cdVersion20300 = 0x20300 // + spare3 + codeLimit64
+	cdVersion3     = 0x20400 // + execSegBase/Limit/Flags
 )
 
 // CodeDirectory is the parsed representation of a CSMAGIC_CODEDIRECTORY blob.
@@ -64,6 +68,8 @@ type CodeDirectory struct {
 	PageSize      uint8 // stored as log2(page size)
 	ScatterOffset uint32
 	TeamOffset    uint32
+	// CodeLimit64 repeats CodeLimit as 64 bits (version 0x20300+).
+	CodeLimit64 uint64
 
 	// Raw blob bytes for hashing/reconstruction.
 	Raw []byte
@@ -113,6 +119,10 @@ type Superblob struct {
 	CodeDirectorySlot *Slot
 	// EntitlementsSlot holds the embedded entitlements (may be nil).
 	EntitlementsSlot *Slot
+	// DerEntitlementsSlot holds the DER-encoded entitlements, slot 7 (may be
+	// nil). Modern iOS ships both slot 5 (XML) and slot 7 (DER) and installd
+	// parses slot 7, so re-signing must keep them consistent.
+	DerEntitlementsSlot *Slot
 	// RequirementsSlot holds the requirements blob (may be nil).
 	RequirementsSlot *Slot
 }
@@ -177,6 +187,8 @@ func (t *ThinFile) ParseSuperblob() (*Superblob, error) {
 			sb.CodeDirectorySlot = &s
 		case slotEntitlements:
 			sb.EntitlementsSlot = &s
+		case slotDerEntitlements:
+			sb.DerEntitlementsSlot = &s
 		case slotRequirements:
 			sb.RequirementsSlot = &s
 		}
@@ -212,26 +224,37 @@ func ParseCodeDirectory(order binary.ByteOrder, raw []byte) (*CodeDirectory, err
 		HashType:      raw[37],
 		Platform:      raw[38],
 		PageSize:      raw[39],
-		ScatterOffset: be.Uint32(raw[44:48]),
-		TeamOffset:    be.Uint32(raw[48:52]),
+		ScatterOffset: 0,
+		TeamOffset:    0,
 		Raw:           raw,
 	}
 	if int(cd.Length) > len(raw) {
 		return nil, errors.New("code directory length out of range")
 	}
+	// Version-dependent trailer fields. Each field only exists from a given
+	// version on, and the blob may be truncated, so guard every read.
+	if cd.Version >= cdVersion20100 && len(raw) >= 48 {
+		cd.ScatterOffset = be.Uint32(raw[44:48])
+	}
+	if cd.Version >= cdVersion20200 && len(raw) >= 52 {
+		cd.TeamOffset = be.Uint32(raw[48:52])
+	}
+	if cd.Version >= cdVersion20300 && len(raw) >= 64 {
+		cd.CodeLimit64 = be.Uint64(raw[56:64])
+	}
+	if cd.Version >= cdVersion3 && len(raw) >= 88 {
+		cd.ExecSegBase = be.Uint64(raw[64:72])
+		cd.ExecSegLimit = be.Uint64(raw[72:80])
+		cd.ExecSegFlags = be.Uint64(raw[80:88])
+	}
 	// Identifier is a C string at IdentOffset.
 	if id, err := cstring(raw, int(cd.IdentOffset)); err == nil {
 		cd.Identifier = id
 	}
-	if cd.Version >= cdVersion2 && cd.TeamOffset > 0 {
+	if cd.TeamOffset > 0 {
 		if team, err := cstring(raw, int(cd.TeamOffset)); err == nil {
 			cd.TeamID = team
 		}
-	}
-	if cd.Version >= cdVersion3 && len(raw) >= 76 {
-		cd.ExecSegBase = be.Uint64(raw[52:60])
-		cd.ExecSegLimit = be.Uint64(raw[60:68])
-		cd.ExecSegFlags = be.Uint64(raw[68:76])
 	}
 	return cd, nil
 }

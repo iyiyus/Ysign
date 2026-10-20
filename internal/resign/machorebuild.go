@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 
 	"ysign/internal/macho"
@@ -74,6 +73,122 @@ func rebuildBinary(data []byte, ctx *signContext) ([]byte, error) {
 	return f.Reassemble(newSlices)
 }
 
+const (
+	// signSpaceSlack is the extra room reserved after the signature blob.
+	// A CMS signature can differ by a few bytes between build passes; without
+	// slack the LC_CODE_SIGNATURE datasize baked into the hashed code bytes
+	// would no longer match the blob actually written.
+	signSpaceSlack = 4096
+	// signSpaceAlign keeps the reserved region page aligned.
+	signSpaceAlign = 4096
+)
+
+// signatureAllocSize returns how many bytes to reserve for the code signature
+// region. Mirroring zsign's ReallocCodeSignSpace, the region is never shrunk:
+// an existing (larger) region is reused as-is, and only growth is allowed.
+func signatureAllocSize(blobLen, existing int) int {
+	n := blobLen + signSpaceSlack
+	if r := n % signSpaceAlign; r != 0 {
+		n += signSpaceAlign - r
+	}
+	if n < existing {
+		n = existing
+	}
+	return n
+}
+
+func alignUp64(v, a uint64) uint64 {
+	if r := v % a; r != 0 {
+		v += a - r
+	}
+	return v
+}
+
+// growLinkEdit extends __LINKEDIT (filesize and vmsize) so the signature
+// region ends at needEnd, keeping the blob inside the segment the way zsign
+// does. It only ever grows the segment.
+//
+// dst selects where the patched segment command is written. When dst is nil the
+// load-command payload (which aliases thin.Data) is patched in place; callers
+// working on a private copy of the image pass that copy together with the
+// matching command offsets instead.
+func growLinkEdit(thin *macho.ThinFile, dst []byte, needEnd uint64) {
+	headerLen := 32
+	if !thin.Is64 {
+		headerLen = 28
+	}
+	off := headerLen
+	for i := range thin.LoadCmds {
+		lc := &thin.LoadCmds[i]
+		cmdOff := off
+		off += int(lc.Size)
+		if lc.Cmd != 0x19 && lc.Cmd != 0x1 {
+			continue
+		}
+		name := string(lc.Payload[0:16])
+		if idx := strings.IndexByte(name, 0); idx >= 0 {
+			name = name[:idx]
+		}
+		if name != "__LINKEDIT" {
+			continue
+		}
+		// payload starts 8 bytes (cmd + cmdsize) after the command base
+		base := cmdOff + 8
+		put := func(vmsize, filesize uint64) {
+			if dst != nil {
+				if lc.Cmd == 0x19 {
+					thin.Endian.PutUint64(dst[base+24:], vmsize)
+					thin.Endian.PutUint64(dst[base+40:], filesize)
+				} else {
+					thin.Endian.PutUint32(dst[base+20:], uint32(vmsize))
+					thin.Endian.PutUint32(dst[base+28:], uint32(filesize))
+				}
+				return
+			}
+			if lc.Cmd == 0x19 {
+				thin.Endian.PutUint64(lc.Payload[24:32], vmsize)
+				thin.Endian.PutUint64(lc.Payload[40:48], filesize)
+			} else {
+				thin.Endian.PutUint32(lc.Payload[20:24], uint32(vmsize))
+				thin.Endian.PutUint32(lc.Payload[28:32], uint32(filesize))
+			}
+		}
+		if lc.Cmd == 0x19 { // LC_SEGMENT_64
+			if len(lc.Payload) < 48 {
+				return
+			}
+			fileoff := thin.Endian.Uint64(lc.Payload[32:40])
+			filesize := thin.Endian.Uint64(lc.Payload[40:48])
+			vmsize := thin.Endian.Uint64(lc.Payload[24:32])
+			if fileoff+filesize >= needEnd {
+				return
+			}
+			filesize = needEnd - fileoff
+			if v := alignUp64(filesize, signSpaceAlign); vmsize < v {
+				vmsize = v
+			}
+			put(vmsize, filesize)
+			return
+		}
+		// LC_SEGMENT (32-bit)
+		if len(lc.Payload) < 32 {
+			return
+		}
+		fileoff := uint64(thin.Endian.Uint32(lc.Payload[24:28]))
+		filesize := uint64(thin.Endian.Uint32(lc.Payload[28:32]))
+		vmsize := uint64(thin.Endian.Uint32(lc.Payload[20:24]))
+		if fileoff+filesize >= needEnd {
+			return
+		}
+		filesize = needEnd - fileoff
+		if v := alignUp64(filesize, signSpaceAlign); vmsize < v {
+			vmsize = v
+		}
+		put(vmsize, filesize)
+		return
+	}
+}
+
 // rebuildSlice re-signs a single thin image.
 func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 	if thin.Signature == nil {
@@ -96,14 +211,30 @@ func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 	if pageSize == 0 {
 		pageSize = 12
 	}
-	if ctx.ForceSHA256 {
+	// SHA-256 is the default: both Apple codesign and zsign emit SHA-256 code
+	// directories, while inheriting the original binary's hash type keeps
+	// SHA-1 for ipas that were themselves produced by a re-signing tool.
+	// Changing the size invalidates the inherited special-slot hashes, so
+	// remember to recompute them below.
+	rehashSpecials := ctx.ForceSHA256 || hashType != signing.HashSHA256
+	if rehashSpecials {
 		hashType, hashSize = signing.HashSHA256, 32
+	}
+
+	// Clamp the inherited CodeDirectory version. 0x20500 and above are not
+	// Apple-defined versions (they come from other re-signing tools) and iOS
+	// rejects a directory whose version it does not know.
+	cdVersion := cd.Version
+	if cdVersion > signing.CDVersionMax {
+		cdVersion = signing.CDVersionMax
 	}
 
 	codeLimit := thin.Signature.DataOffset
 	if codeLimit == 0 || int(codeLimit) > len(thin.Data) {
 		codeLimit = uint32(len(thin.Data))
 	}
+	nSpecial := int(cd.NSpecialSlots)
+
 	// Determine requirements + entitlements blobs to carry into the superblob.
 	var reqBlob []byte
 	if sb.RequirementsSlot != nil && sb.RequirementsSlot.Blob != nil {
@@ -115,14 +246,24 @@ func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 	} else if sb.EntitlementsSlot != nil && sb.EntitlementsSlot.Blob != nil {
 		entBlob = sb.EntitlementsSlot.Blob.Data
 	}
+	// Slot 7 carries the DER-encoded entitlements. Modern iOS parses that form,
+	// so it has to be regenerated together with slot 5 -- otherwise the CD
+	// seals a stale DER hash and installd rejects the entitlements.
+	var derEntBlob []byte
+	if nSpecial >= 7 {
+		if ctx.EntitlementsXML != nil {
+			derEntBlob = signing.BuildDerEntitlementsBlob(ctx.EntitlementsXML)
+		} else if sb.DerEntitlementsSlot != nil && sb.DerEntitlementsSlot.Blob != nil {
+			derEntBlob = sb.DerEntitlementsSlot.Blob.Data
+		}
+	}
 
 	// Special slot hashes.
-	nSpecial := int(cd.NSpecialSlots)
 	special := make([][]byte, nSpecial)
 	for i := 0; i < nSpecial; i++ {
 		special[i] = cd.SpecialSlotHash(-(i + 1))
 	}
-	if ctx.ForceSHA256 {
+	if rehashSpecials {
 		// -2/--sha256_only: recompute every special slot at the forced SHA-256
 		// size from the actual sealed data (Info.plist, requirements,
 		// CodeResources, entitlements), zero-filling slots whose data is
@@ -141,6 +282,21 @@ func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 			}
 		}
 	}
+	// Slot -3 seals CodeResources. Every bundle's copy is regenerated on this
+	// run, including nested ones, so the hash has to be refreshed here too --
+	// it cannot stay inside the branch above, which skips binaries that keep
+	// their original special hashes.
+	if ctx.SpecialCodeResources != nil && nSpecial >= 3 {
+		if h, err := signing.HashBytes(hashType, ctx.SpecialCodeResources); err == nil {
+			special[2] = h // slot -3
+		}
+	}
+	// Keep slot -7 in sync with the DER blob that is actually embedded below.
+	if derEntBlob != nil && nSpecial >= 7 {
+		if h, err := signing.HashBytes(hashType, derEntBlob); err == nil {
+			special[6] = h // slot -7
+		}
+	}
 
 	// Determine identifier/team: only the main binary gets the new identity;
 	// embedded binaries (frameworks/extensions) keep their own identifier.
@@ -150,11 +306,23 @@ func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 		teamID = ctx.TeamID
 	}
 
+	// Replace the inherited designated requirement: it names the previous
+	// signer's certificate, which ours does not satisfy. Rebuild it for the
+	// identity actually signing and reseal the slot -2 hash.
+	if cn := signing.SignerCommonName(ctx.Signer); cn != "" {
+		reqBlob = signing.BuildRequirementsBlob(identifier, cn)
+		if len(special) >= 2 {
+			if h, err := signing.HashBytes(hashType, reqBlob); err == nil {
+				special[1] = h // slot -2
+			}
+		}
+	}
+
 	// Two-pass build: page hashes must cover the post-patch LC_CODE_SIGNATURE
 	// datasize, but the blob length is independent of the hash values.
 	buildPass := func(hashes [][]byte) ([]byte, error) {
 		params := &signing.CodeDirectoryParams{
-			Version:       cd.Version,
+			Version:       cdVersion,
 			Flags:         cd.Flags,
 			Platform:      cd.Platform,
 			PageSizeLog:   pageSize,
@@ -175,47 +343,112 @@ func rebuildSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error) {
 		return signing.BuildCodeDirectory(thin.Data[:codeLimit], params)
 	}
 
-	// Pass 1: provisional CD (page hashes over unpatched bytes) -> blob size.
-	code := thin.Data[:codeLimit]
-	provHashes := pageHashesCached(ctx, code, codeLimit, pageSize, hashType)
-	provCD, err := buildPass(provHashes)
-	if err != nil {
-		return nil, err
+	// Iterative build: LC_CODE_SIGNATURE's datasize is part of the hashed code
+	// bytes, so it must be patched before the page hashes are computed, but the
+	// reserved size depends on the blob length. Reserve slack (never shrinking
+	// an existing region, as zsign does) and iterate until the blob fits.
+	//
+	// Pass 1 sizes the blob with zeroed page digests: the CodeDirectory length
+	// depends only on the page COUNT, never on the digests, so the multi-GB
+	// code bytes are hashed exactly once, in pass 2.
+	existing := int(thin.Signature.DataSize)
+	nPages := (int(codeLimit) + (1 << pageSize) - 1) / (1 << pageSize)
+	if nPages == 0 {
+		nPages = 1
 	}
-	sig1, err := buildSignature(provCD, ctx)
-	if err != nil {
-		return nil, err
+	alloc := 0
+	var finalBlob []byte
+	for iter := 0; iter < 4; iter++ {
+		code := thin.Data[:codeLimit]
+		var hashes [][]byte
+		if alloc == 0 {
+			hashes = zeroPageHashes(nPages, int(hashSize))
+		} else {
+			var err error
+			hashes, err = pageHashesCached(ctx, code, codeLimit, pageSize, hashType)
+			if err != nil {
+				return nil, err
+			}
+		}
+		finalCD, err := buildPass(hashes)
+		if err != nil {
+			return nil, err
+		}
+		sig, err := buildSignature(finalCD, ctx)
+		if err != nil {
+			return nil, err
+		}
+		blob := buildSuperblob(finalCD, reqBlob, entBlob, derEntBlob, sig)
+		if alloc > 0 && len(blob) <= alloc {
+			finalBlob = blob
+			break
+		}
+		next := signatureAllocSize(len(blob), existing)
+		if next <= alloc {
+			// Guarantee forward progress so the loop cannot spin.
+			next = alloc + signSpaceAlign
+		}
+		alloc = next
+		if err := thin.PatchSignatureSize(uint32(alloc)); err != nil {
+			return nil, err
+		}
+		growLinkEdit(thin, nil, uint64(codeLimit)+uint64(alloc))
 	}
-	blob1 := buildSuperblob(provCD, reqBlob, entBlob, nil, sig1)
-	finalSize := len(blob1)
+	if finalBlob == nil {
+		return nil, errors.New("code signature did not converge")
+	}
 
-	// Patch the LC_CODE_SIGNATURE datasize (this changes the hashed code bytes).
-	if err := thin.PatchSignatureSize(uint32(finalSize)); err != nil {
-		return nil, err
-	}
-
-	// Pass 2: recompute page hashes over the patched code, rebuild CD + sig.
-	code = thin.Data[:codeLimit]
-	hashes := pageHashesCached(ctx, code, codeLimit, pageSize, hashType)
-	finalCD, err := buildPass(hashes)
-	if err != nil {
-		return nil, err
-	}
-	sig2, err := buildSignature(finalCD, ctx)
-	if err != nil {
-		return nil, err
-	}
-	blob2 := buildSuperblob(finalCD, reqBlob, entBlob, nil, sig2)
-
-	out := make([]byte, 0, len(code)+len(blob2))
-	out = append(out, code...)
-	out = append(out, blob2...)
-	return out, nil
+	return emitImage(thin.Data[:codeLimit], finalBlob, alloc), nil
 }
 
-func pageHashesCached(ctx *signContext, code []byte, codeLimit uint32, pageSizeLog, hashType uint8) [][]byte {
-	if ctx.Cache != nil && !ctx.Force {
-		key := "ph_" + signing.Key(code)
+// emitImage appends blob plus zero padding to code, producing an image of
+// exactly len(code)+alloc bytes.
+//
+// Appending into code's spare capacity (the previous signature region when
+// re-signing) reuses the buffer instead of allocating and copying a whole
+// multi-GB image a second time; growing once up front keeps it to at most a
+// single copy when there is not enough room.
+func emitImage(code []byte, blob []byte, alloc int) []byte {
+	total := len(code) + alloc
+	out := code
+	if cap(out) < total {
+		grown := make([]byte, len(out), total)
+		copy(grown, out)
+		out = grown
+	}
+	out = append(out, blob...)
+	if pad := total - len(out); pad > 0 {
+		out = append(out, make([]byte, pad)...)
+	}
+	return out
+}
+
+// zeroPageHashes returns n page digests that all alias one zero buffer. The
+// CodeDirectory's size depends only on the page count, so this sizes the blob
+// without hashing any code bytes.
+func zeroPageHashes(n, hashSize int) [][]byte {
+	zero := make([]byte, hashSize)
+	out := make([][]byte, n)
+	for i := range out {
+		out[i] = zero
+	}
+	return out
+}
+
+// cacheMaxPayload caps how large a code payload may be before the cache is
+// skipped entirely. The cache key costs a full SHA-256 pass over the payload
+// and the stored value holds one digest per 4 KiB page (32 MB of digests per
+// GB of code), so on big images the cache costs far more than the parallel
+// hashing it would save.
+const cacheMaxPayload = 32 << 20
+
+func pageHashesCached(ctx *signContext, code []byte, codeLimit uint32, pageSizeLog, hashType uint8) ([][]byte, error) {
+	cacheable := ctx.Cache != nil && !ctx.Force && len(code) <= cacheMaxPayload
+	// The digest size must be part of the key: a cached SHA-1 array (20 bytes
+	// per page) also divides evenly by 32, so without it switching to SHA-256
+	// would return the old digests reinterpreted as SHA-256 ones.
+	key := fmt.Sprintf("ph_%d_%s", hashType, signing.Key(code))
+	if cacheable {
 		if data, ok := ctx.Cache.Get(key); ok {
 			hs := int(hashSizeFor(hashType))
 			if hs > 0 && len(data)%hs == 0 {
@@ -223,22 +456,22 @@ func pageHashesCached(ctx *signContext, code []byte, codeLimit uint32, pageSizeL
 				for i := 0; i+hs <= len(data); i += hs {
 					out = append(out, data[i:i+hs])
 				}
-				return out
+				return out, nil
 			}
 		}
 	}
 	hashes, err := signing.ComputePageHashes(code, codeLimit, pageSizeLog, hashType)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	if ctx.Cache != nil {
-		var joined []byte
+	if cacheable {
+		joined := make([]byte, 0, len(hashes)*int(hashSizeFor(hashType)))
 		for _, h := range hashes {
 			joined = append(joined, h...)
 		}
-		_ = ctx.Cache.Set("ph_"+signing.Key(code), joined)
+		_ = ctx.Cache.Set(key, joined)
 	}
-	return hashes
+	return hashes, nil
 }
 
 func hashSizeFor(hashType uint8) int {
@@ -296,6 +529,12 @@ func specialHashesAt(orig [][]byte, ctx *signContext, reqBlob, entBlob []byte, h
 	return out
 }
 
+// cmsCacheVersion namespaces cached CMS blobs. Bump it whenever the CMS
+// encoding changes: a stale entry is returned verbatim for an identical
+// CodeDirectory, so an old blob would otherwise keep shadowing new builds and
+// silently ship invalid signatures.
+const cmsCacheVersion = "v2"
+
 // buildSignature produces the CMS signature blob (or ad-hoc) for a CD.
 func buildSignature(cd []byte, ctx *signContext) ([]byte, error) {
 	var cms []byte
@@ -304,7 +543,7 @@ func buildSignature(cd []byte, ctx *signContext) ([]byte, error) {
 		cms, err = signing.BuildCMSAdHoc(cd)
 	} else if ctx.Signer != nil {
 		cdKey := signing.Key(cd)
-		key := "cms_" + cdKey + "_" + certID(ctx.Signer)
+		key := "cms_" + cmsCacheVersion + "_" + cdKey + "_" + certID(ctx.Signer)
 		if cached, ok := ctx.Cache.Get(key); ok && !ctx.Force {
 			cms = cached
 		} else {
@@ -396,6 +635,18 @@ func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error
 	img := make([]byte, len(thin.Data))
 	copy(img, thin.Data)
 
+	// The command goes into the padding that usually sits between the load
+	// commands and the first section. Verify the room is really free: writing
+	// over section data would silently corrupt the image.
+	if lcEnd+16 > len(img) {
+		return nil, errors.New("no room to add LC_CODE_SIGNATURE after the load commands")
+	}
+	for _, b := range img[lcEnd : lcEnd+16] {
+		if b != 0 {
+			return nil, errors.New("no free padding to add LC_CODE_SIGNATURE; binary has no header slack")
+		}
+	}
+
 	// Write LC_CODE_SIGNATURE (linkedit_data_command) at lcEnd.
 	thin.Endian.PutUint32(img[lcEnd:], 0x1d)       // LC_CODE_SIGNATURE
 	thin.Endian.PutUint32(img[lcEnd+4:], 16)       // cmdsize
@@ -441,7 +692,10 @@ func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error
 	isExecutable := thin.FileType == 2 // MH_EXECUTE
 	entBlob := signing.BuildEntitlementsBlob(ctx.EntitlementsXML)
 	derEntBlob := signing.BuildDerEntitlementsBlob(ctx.EntitlementsXML)
-	reqBlob := signing.StandardRequirementsBlob
+	// The designated requirement names the certificate that signs this binary,
+	// so it must be rebuilt from the signer's subject CN; a captured blob would
+	// name some other certificate and iOS would reject the signature.
+	reqBlob := signing.BuildRequirementsBlob(ctx.BundleID, signing.SignerCommonName(ctx.Signer))
 
 	// Special hashes are indexed by CSSLOT type:
 	//   1=Info.plist, 2=Requirements, 3=CodeResources, 5=XML Entitlements, 7=DER Entitlements
@@ -519,61 +773,64 @@ func rebuildUnsignedSlice(thin *macho.ThinFile, ctx *signContext) ([]byte, error
 		return signing.BuildCodeDirectory(img[:codeLimit], params)
 	}
 
-	// Pass 1: provisional blob to learn its size.
-	provHashes := pageHashesCached(ctx, img[:codeLimit], codeLimit, 12, hashType)
-	provCD, err := buildPass(provHashes)
-	if err != nil {
-		return nil, err
+	// Iterative build: reserve slack up front (zsign never sizes the region to
+	// the exact blob length) so a few bytes of CMS length jitter between
+	// passes cannot desync datasize / __LINKEDIT from what is written.
+	//
+	// Pass 1 sizes the blob from zeroed page digests, so the code bytes are
+	// hashed once (in pass 2) instead of twice.
+	//
+	// thin.LoadCmds point into thin.Data, not into img, so patching through
+	// the load-command list would not touch img; patch img explicitly instead.
+	nPages := (int(codeLimit) + (1 << 12) - 1) / (1 << 12)
+	if nPages == 0 {
+		nPages = 1
 	}
-	provSig, err := buildSignature(provCD, ctx)
-	if err != nil {
-		return nil, err
-	}
-	provBlob := buildSuperblob(provCD, reqBlob, entBlob, derEntBlob, provSig)
-
-	// Patch datasize in the LC we just wrote.
-	thin.Endian.PutUint32(img[lcEnd+12:], uint32(len(provBlob)))
-
-	// Extend __LINKEDIT segment vmsize/filesize by the blob size, matching
-	// zsign. iOS requires the signature blob to live inside __LINKEDIT.
-	off := headerLen
-	for _, c := range thin.LoadCmds {
-		if c.Cmd == 0x19 && len(c.Payload) >= 48 {
-			name := string(c.Payload[0:16])
-			if idx := strings.IndexByte(name, 0); idx >= 0 {
-				name = name[:idx]
-			}
-			if name == "__LINKEDIT" {
-				vm := thin.Endian.Uint64(c.Payload[24:32])
-				fs := thin.Endian.Uint64(c.Payload[40:48])
-				fmt.Fprintf(os.Stderr, "[dbg] __LINKEDIT off=%d vmsize=%d filesize=%d blob=%d\n", off, vm, fs, len(provBlob))
-				fsAfter := fs + uint64(len(provBlob))
-				const pageSize = 4096
-				vmAfter := (fsAfter + pageSize - 1) &^ (pageSize - 1)
-				fmt.Fprintf(os.Stderr, "[dbg] fsAfter=%d vmAfter=%d\n", fsAfter, vmAfter)
-				thin.Endian.PutUint64(img[off+8+24:], vmAfter)
-				thin.Endian.PutUint64(img[off+8+40:], fsAfter)
+	alloc := 0
+	var finalBlob []byte
+	for iter := 0; iter < 4; iter++ {
+		var hashes [][]byte
+		if alloc == 0 {
+			hashes = zeroPageHashes(nPages, int(hashSize))
+		} else {
+			var err error
+			hashes, err = pageHashesCached(ctx, img[:codeLimit], codeLimit, 12, hashType)
+			if err != nil {
+				return nil, err
 			}
 		}
-		off += int(c.Size)
+		finalCD, err := buildPass(hashes)
+		if err != nil {
+			return nil, err
+		}
+		finalSig, err := buildSignature(finalCD, ctx)
+		if err != nil {
+			return nil, err
+		}
+		blob := buildSuperblob(finalCD, reqBlob, entBlob, derEntBlob, finalSig)
+		if alloc > 0 && len(blob) <= alloc {
+			finalBlob = blob
+			break
+		}
+		next := signatureAllocSize(len(blob), 0)
+		if next <= alloc {
+			next = alloc + signSpaceAlign
+		}
+		alloc = next
+
+		// Patch datasize in the LC we just wrote.
+		thin.Endian.PutUint32(img[lcEnd+12:], uint32(alloc))
+
+		// Extend __LINKEDIT vmsize/filesize so the reserved region lives
+		// inside the segment, matching zsign. The load commands alias
+		// thin.Data, so patch the private copy img explicitly.
+		growLinkEdit(thin, img, uint64(codeLimit)+uint64(alloc))
+	}
+	if finalBlob == nil {
+		return nil, errors.New("code signature did not converge")
 	}
 
-	// Pass 2: recompute page hashes over the patched image.
-	hashes := pageHashesCached(ctx, img[:codeLimit], codeLimit, 12, hashType)
-	finalCD, err := buildPass(hashes)
-	if err != nil {
-		return nil, err
-	}
-	finalSig, err := buildSignature(finalCD, ctx)
-	if err != nil {
-		return nil, err
-	}
-	finalBlob := buildSuperblob(finalCD, reqBlob, entBlob, derEntBlob, finalSig)
-
-	out := make([]byte, 0, codeLimit+uint32(len(finalBlob)))
-	out = append(out, img[:codeLimit]...)
-	out = append(out, finalBlob...)
-	return out, nil
+	return emitImage(img[:codeLimit], finalBlob, alloc), nil
 }
 
 func allZero(b []byte) bool {

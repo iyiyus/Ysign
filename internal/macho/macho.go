@@ -21,6 +21,10 @@ const (
 
 	// LC_CODE_SIGNATURE : linkedit_data_command -> Code Signature blob.
 	lcCodeSignature = 0x1d
+
+	// defaultFatAlign is used when a fat arch entry carries no alignment
+	// requirement. iOS arm64 slices are page-aligned at 16 KB.
+	defaultFatAlign = uint64(0x4000)
 )
 
 // LoadCommand is a raw Mach-O load command.
@@ -258,6 +262,18 @@ func (f *File) Reassemble(slices [][]byte) ([]byte, error) {
 	}
 	offsets := make([]uint64, len(slices))
 	for i, ns := range slices {
+		// Each slice must start at a multiple of 2^align (iOS arm64 uses
+		// 0x4000). Skipping this produces a universal binary the loader
+		// rejects, so pad with zeros between slices.
+		align := defaultFatAlign
+		if i < len(f.FatArch) {
+			if a := f.FatArch[i].Align; a > 0 && a < 31 {
+				align = uint64(1) << a
+			}
+		}
+		if align > 1 {
+			offset = (offset + align - 1) &^ (align - 1)
+		}
 		offsets[i] = offset
 		offset += uint64(len(ns))
 	}
@@ -283,9 +299,11 @@ func (f *File) Reassemble(slices [][]byte) ([]byte, error) {
 			hdr = append(hdr, u32(o, a.Align)...)
 		}
 	}
-	out := hdr
-	for _, ns := range slices {
-		out = append(out, ns...)
+	// Zero-filled buffer: the gaps between slices are the alignment padding.
+	out := make([]byte, offset)
+	copy(out, hdr)
+	for i, ns := range slices {
+		copy(out[offsets[i]:], ns)
 	}
 	return out, nil
 }

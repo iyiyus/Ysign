@@ -1,13 +1,17 @@
 package signing
 
 import (
+	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"howett.net/plist"
+	"runtime"
 	"sort"
+	"sync"
+
+	"howett.net/plist"
 )
 
 // Code signature blob magics and slots (mirror of macho package constants).
@@ -32,9 +36,17 @@ const (
 	HashSHA1   = 1
 	HashSHA256 = 2
 
-	cdVersion2 = 0x20000
-	cdVersion3 = 0x20400
+	cdVersion2     = 0x20000
+	cdVersion20100 = 0x20100 // + scatterOffset
+	cdVersion20200 = 0x20200 // + teamOffset
+	cdVersion20300 = 0x20300 // + spare3 + codeLimit64
+	cdVersion3     = 0x20400 // + execSegBase/Limit/Flags
 )
+
+// CDVersionMax is the newest CodeDirectory version Apple defines
+// (CS_SUPPORTS_EXECSEG). Versions above it are not recognised by iOS, so an
+// inherited one is clamped to this value.
+const CDVersionMax = cdVersion3
 
 // HashBytes returns the code-signing hash of b for the given hash type.
 func HashBytes(hashType uint8, b []byte) ([]byte, error) {
@@ -110,17 +122,30 @@ func BuildCodeDirectory(content []byte, p *CodeDirectoryParams) ([]byte, error) 
 	if int(p.CodeLimit) > len(content) {
 		return nil, fmt.Errorf("codeLimit %d exceeds content %d", p.CodeLimit, len(content))
 	}
+	// Bump the version when the caller needs fields the requested version
+	// cannot express: a team id needs 0x20200, exec-segment info 0x20400.
+	version := p.Version
+	minVersion := uint32(cdVersion2)
+	if p.TeamID != "" {
+		minVersion = cdVersion20200
+	}
+	if p.ExecSegBase != 0 || p.ExecSegLimit != 0 || p.ExecSegFlags != 0 {
+		minVersion = cdVersion3
+	}
+	if version < minVersion {
+		version = minVersion
+	}
 	headerLen := 44
-	if p.Version >= cdVersion2 {
+	if version >= cdVersion2 {
 		headerLen += 4 // scatterOffset
 	}
-	if p.Version >= 0x20200 {
+	if version >= cdVersion20200 {
 		headerLen += 4 // teamOffset
 	}
-	if p.Version >= 0x20300 {
+	if version >= cdVersion20300 {
 		headerLen += 4 + 8 // spare3 + codeLimit64
 	}
-	if p.Version >= 0x20400 {
+	if version >= cdVersion3 {
 		headerLen += 8 + 8 + 8 // execSegBase + execSegLimit + execSegFlags
 	}
 	nCodeSlots := (int(p.CodeLimit) + pageBytes - 1) / pageBytes
@@ -141,7 +166,7 @@ func BuildCodeDirectory(content []byte, p *CodeDirectoryParams) ([]byte, error) 
 	order := binary.BigEndian // code signature blobs are always big-endian
 	order.PutUint32(buf[0:], csMagicCodeDirectory)
 	order.PutUint32(buf[4:], uint32(total))
-	order.PutUint32(buf[8:], p.Version)
+	order.PutUint32(buf[8:], version)
 	order.PutUint32(buf[12:], p.Flags)
 	order.PutUint32(buf[16:], hashOffset)
 	order.PutUint32(buf[20:], identOffset)
@@ -152,14 +177,22 @@ func BuildCodeDirectory(content []byte, p *CodeDirectoryParams) ([]byte, error) 
 	buf[37] = p.HashType
 	buf[38] = p.Platform
 	buf[39] = p.PageSizeLog
-	buf[40] = 0 // spare2
-	order.PutUint32(buf[44:], 0) // scatterOffset
-	order.PutUint32(buf[48:], teamOffset)
-	order.PutUint32(buf[52:], 0) // spare3
-	if p.Version >= 0x20300 {
-		order.PutUint64(buf[56:], 0) // codeLimit64 (zsign leaves it 0)
+	// Trailer fields exist only from their version onwards; writing them
+	// unconditionally would overwrite the identifier string on older CDs.
+	if version >= cdVersion20100 {
+		order.PutUint32(buf[44:], 0) // scatterOffset
 	}
-	if p.Version >= 0x20400 {
+	if version >= cdVersion20200 {
+		order.PutUint32(buf[48:], teamOffset)
+	}
+	if version >= cdVersion20300 {
+		order.PutUint32(buf[52:], 0) // spare3
+		// codeLimit64 stays 0: Apple only fills it when the code limit does not
+		// fit in 32 bits, and zsign leaves it zero too. Writing the real limit
+		// here diverges from both and is needlessly risky.
+		order.PutUint64(buf[56:], 0)
+	}
+	if version >= cdVersion3 {
 		order.PutUint64(buf[64:], p.ExecSegBase)
 		order.PutUint64(buf[72:], p.ExecSegLimit)
 		order.PutUint64(buf[80:], p.ExecSegFlags)
@@ -183,22 +216,21 @@ func BuildCodeDirectory(content []byte, p *CodeDirectoryParams) ([]byte, error) 
 		copy(buf[pos:], h)
 		pos += int(p.HashSize)
 	}
-	// Code page hashes.
+	// Code page hashes. When the caller did not supply them, hash the pages
+	// here (in parallel) rather than one at a time.
+	if p.CodeHashes == nil {
+		hashes, err := ComputePageHashes(content, p.CodeLimit, p.PageSizeLog, p.HashType)
+		if err != nil {
+			return nil, err
+		}
+		p.CodeHashes = hashes
+	}
 	for i := 0; i < nCodeSlots; i++ {
 		var h []byte
-		if p.CodeHashes != nil && i < len(p.CodeHashes) {
+		if i < len(p.CodeHashes) {
 			h = p.CodeHashes[i]
 		} else {
-			start := i * pageBytes
-			end := start + pageBytes
-			if end > int(p.CodeLimit) {
-				end = int(p.CodeLimit)
-			}
-			var err error
-			h, err = HashBytes(p.HashType, content[start:end])
-			if err != nil {
-				return nil, err
-			}
+			h = make([]byte, p.HashSize)
 		}
 		if len(h) != int(p.HashSize) {
 			return nil, fmt.Errorf("code slot hash %d has %d bytes, want %d", i, len(h), p.HashSize)
@@ -209,26 +241,113 @@ func BuildCodeDirectory(content []byte, p *CodeDirectoryParams) ([]byte, error) 
 	return buf, nil
 }
 
+// HashSize returns the digest length in bytes for a code-signing hash type,
+// or 0 when the type is unsupported.
+func HashSize(hashType uint8) int {
+	switch hashType {
+	case HashSHA256:
+		return sha256.Size
+	case HashSHA1:
+		return sha1.Size
+	default:
+		return 0
+	}
+}
+
+// hashInto writes the hash of data into dst, which must be HashSize bytes.
+func hashInto(dst, data []byte, hashType uint8) error {
+	switch hashType {
+	case HashSHA256:
+		s := sha256.Sum256(data)
+		copy(dst, s[:])
+		return nil
+	case HashSHA1:
+		s := sha1.Sum(data)
+		copy(dst, s[:])
+		return nil
+	default:
+		return fmt.Errorf("unsupported hash type %d", hashType)
+	}
+}
+
+// parallelHashPages is the minimum number of code pages that must be hashed
+// before spawning goroutines pays off; below it the scheduling cost dominates.
+const parallelHashPages = 64
+
 // ComputePageHashes returns the code-slot hashes for content[:codeLimit].
+//
+// Pages are independent, so the work is split into contiguous chunks hashed
+// concurrently: for multi-hundred-MB and multi-GB images this is the single
+// hottest loop in the whole signer and scales with the core count. All digests
+// share one backing array to avoid a million tiny allocations.
 func ComputePageHashes(content []byte, codeLimit uint32, pageSizeLog, hashType uint8) ([][]byte, error) {
 	pageBytes := 1 << pageSizeLog
 	n := (int(codeLimit) + pageBytes - 1) / pageBytes
 	if n == 0 {
 		n = 1
 	}
-	out := make([][]byte, 0, n)
-	for i := 0; i < n; i++ {
+	hs := HashSize(hashType)
+	if hs == 0 {
+		return nil, fmt.Errorf("unsupported hash type %d", hashType)
+	}
+	buf := make([]byte, n*hs)
+	out := make([][]byte, n)
+	for i := range out {
+		out[i] = buf[i*hs : (i+1)*hs]
+	}
+	limit := int(codeLimit)
+	if limit > len(content) {
+		limit = len(content)
+	}
+	hashPage := func(i int) error {
 		start := i * pageBytes
 		end := start + pageBytes
-		if end > int(codeLimit) {
-			end = int(codeLimit)
+		if end > limit {
+			end = limit
 		}
-		h, err := HashBytes(hashType, content[start:end])
-		if err != nil {
-			return nil, err
+		if start > end {
+			start = end
 		}
-		out = append(out, h)
+		return hashInto(out[i], content[start:end], hashType)
 	}
+
+	workers := runtime.NumCPU()
+	if workers > n {
+		workers = n
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	if workers == 1 || n < parallelHashPages {
+		for i := 0; i < n; i++ {
+			if err := hashPage(i); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
+
+	var wg sync.WaitGroup
+	chunk := (n + workers - 1) / workers
+	for w := 0; w < workers; w++ {
+		start := w * chunk
+		if start >= n {
+			break
+		}
+		end := start + chunk
+		if end > n {
+			end = n
+		}
+		wg.Add(1)
+		go func(s, e int) {
+			defer wg.Done()
+			// hash type was validated above, so hashPage cannot fail here
+			for i := s; i < e; i++ {
+				_ = hashPage(i)
+			}
+		}(start, end)
+	}
+	wg.Wait()
 	return out, nil
 }
 
@@ -287,15 +406,23 @@ func derEncodePlistValue(v interface{}) []byte {
 		return derTLV(0x30, body)
 	case map[string]interface{}:
 		// dict -> SET (0x31) OF SEQUENCE { key UTF8String, value }
-		keys := make([]string, 0, len(x))
-		for k := range x {
-			keys = append(keys, k)
+		//
+		// DER (X.690 11.6) requires SET OF members to be ordered by their
+		// encoded bytes, not by key: the length octets take part in the
+		// comparison, so an entry with a short value sorts before one with a
+		// long key. installd rejects a set that is not in canonical order,
+		// which shows up as an app that cannot be installed.
+		entries := make([][]byte, 0, len(x))
+		for k, v := range x {
+			entry := append(derTLV(0x0c, []byte(k)), derEncodePlistValue(v)...)
+			entries = append(entries, derTLV(0x30, entry))
 		}
-		sort.Strings(keys)
+		sort.Slice(entries, func(i, j int) bool {
+			return bytes.Compare(entries[i], entries[j]) < 0
+		})
 		var body []byte
-		for _, k := range keys {
-			entry := append(derTLV(0x0c, []byte(k)), derEncodePlistValue(x[k])...)
-			body = append(body, derTLV(0x30, entry)...)
+		for _, e := range entries {
+			body = append(body, e...)
 		}
 		return derTLV(0x31, body)
 	}

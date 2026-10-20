@@ -69,7 +69,11 @@ func ParseProvision(der []byte) (*Provision, error) {
 			}
 		}
 	}
-	if len(p.AppIdentifierPrefixes) > 0 {
+	// AppIdentifier is the full sealed id ("TEAMID.com.example.app"); fall back
+	// to the bare prefix when the profile carries no entitlements.
+	if ai, ok := p.Entitlements["application-identifier"].(string); ok && ai != "" {
+		p.AppIdentifier = ai
+	} else if len(p.AppIdentifierPrefixes) > 0 {
 		p.AppIdentifier = p.AppIdentifierPrefixes[0]
 	}
 	return p, nil

@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"path/filepath"
 )
 
 // Load command constants used for dylib injection/removal.
@@ -22,6 +23,8 @@ const (
 	lcEncryptionInfo  = 0x21
 	lcEncryption64    = 0x2c
 	lcDylibCodeSigDRs = 0x2b
+	lcSymtab          = 0x2
+	lcDysymtab        = 0xb
 )
 
 // buildDylibCommand constructs a dylib_command load command.
@@ -84,7 +87,9 @@ func AddLoadDylib(data []byte, path string, weak bool) ([]byte, error) {
 }
 
 // RemoveLoadDylib removes all LC_LOAD_DYLIB / LC_LOAD_WEAK_DYLIB commands whose
-// name equals path (or contains it) from every slice.
+// name matches path. Matching is exact on the full install name or on the file
+// name only (so -D libfoo.dylib also drops @rpath/libfoo.dylib), which avoids
+// the accidental removals a substring match would cause.
 func RemoveLoadDylib(data []byte, path string) ([]byte, error) {
 	f, err := Parse(data)
 	if err != nil {
@@ -94,7 +99,7 @@ func RemoveLoadDylib(data []byte, path string) ([]byte, error) {
 	for i, thin := range f.Slices {
 		ns, err := rewriteLoadCommands(thin, func(cmd uint32, payload []byte, order binary.ByteOrder) ([]byte, bool, error) {
 			name := dylibName(cmd, payload, order)
-			if name != "" && (name == path || contains(name, path)) {
+			if name != "" && (name == path || filepath.Base(name) == filepath.Base(path)) {
 				return nil, false, nil // drop
 			}
 			return nil, true, nil // keep
@@ -105,18 +110,6 @@ func RemoveLoadDylib(data []byte, path string) ([]byte, error) {
 		newSlices[i] = ns
 	}
 	return f.Reassemble(newSlices)
-}
-
-func contains(s, sub string) bool {
-	if len(sub) == 0 {
-		return false
-	}
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
 
 // rewriteLoadCommands rebuilds a thin image's header + load command region.
@@ -162,8 +155,9 @@ func rewriteLoadCommands(thin *ThinFile, keep func(cmd uint32, payload []byte, o
 	}
 	delta := int32(len(newLoads)) - int32(len(oldLoads))
 
-	// Patch every file offset in the new load commands by delta.
-	adjustOffsets(newLoads, thin.Endian, delta)
+	// Patch every file offset in the new load commands by delta. Only offsets
+	// at or past the original end of the load-command region move.
+	adjustOffsets(newLoads, thin.Endian, delta, uint32(loadEnd))
 
 	// New header with updated ncmds/sizeofcmds.
 	newHeader := make([]byte, headerLen)
@@ -179,7 +173,11 @@ func rewriteLoadCommands(thin *ThinFile, keep func(cmd uint32, payload []byte, o
 	return out, nil
 }
 
-func adjustOffsets(loads []byte, order binary.ByteOrder, delta int32) {
+// adjustOffsets shifts every file offset inside the rebuilt load-command block
+// by delta. shiftFrom is the original end of the load-command region: only
+// offsets pointing at (or after) it actually move. Offsets such as __TEXT's
+// fileoff (0) or __PAGEZERO's must be left alone, or the image is corrupted.
+func adjustOffsets(loads []byte, order binary.ByteOrder, delta int32, shiftFrom uint32) {
 	off := 0
 	for off+8 <= len(loads) {
 		cmd := order.Uint32(loads[off : off+4])
@@ -188,66 +186,93 @@ func adjustOffsets(loads []byte, order binary.ByteOrder, delta int32) {
 			break
 		}
 		payload := loads[off+8 : off+size]
-		adjustCommand(cmd, payload, order, delta)
+		adjustCommand(cmd, payload, order, delta, shiftFrom)
 		off += size
 	}
 }
 
-func adjustCommand(cmd uint32, payload []byte, order binary.ByteOrder, delta int32) {
+// shiftOffset adds delta to the uint32 at payload[pos], but only when that
+// value denotes a location at or after shiftFrom.
+func shiftOffset(payload []byte, pos int, order binary.ByteOrder, delta int32, shiftFrom uint32) {
+	if pos < 0 || pos+4 > len(payload) {
+		return
+	}
+	cur := order.Uint32(payload[pos : pos+4])
+	if cur < shiftFrom {
+		return
+	}
+	order.PutUint32(payload[pos:pos+4], cur+uint32(int64(delta)))
+}
+
+func adjustCommand(cmd uint32, payload []byte, order binary.ByteOrder, delta int32, shiftFrom uint32) {
 	// Commands whose first payload word is a file offset (linkedit_data_command,
 	// dyld_info_command, encryption_info_command).
 	switch cmd {
 	case lcCodeSignature, lcSegmentSplit, lcFunctionStarts, lcDataInCode,
 		lcDyldChained, lcDyldExports, lcEncryptionInfo, lcEncryption64,
 		lcDylibCodeSigDRs, lcDyldInfo, lcDyldInfoOnly:
-		if len(payload) >= 4 {
-			order.PutUint32(payload[0:4], order.Uint32(payload[0:4])+uint32(int64(delta)))
-		}
-		// dyld_info_command also has bind/weak/lazy/export offsets.
+		shiftOffset(payload, 0, order, delta, shiftFrom)
+		// dyld_info_command: rebase/bind/weak_bind/lazy_bind/export offsets sit
+		// every 8 bytes (offset followed by its size) -- only the offsets shift.
 		if cmd == lcDyldInfo || cmd == lcDyldInfoOnly {
-			for i := 4; i+4 <= len(payload) && i <= 16; i += 4 {
-				order.PutUint32(payload[i:i+4], order.Uint32(payload[i:i+4])+uint32(int64(delta)))
+			for i := 8; i+4 <= len(payload) && i <= 32; i += 8 {
+				shiftOffset(payload, i, order, delta, shiftFrom)
 			}
 		}
+	case lcSymtab:
+		// symtab_command: symoff, nsyms, stroff, strsize.
+		shiftOffset(payload, 0, order, delta, shiftFrom)
+		shiftOffset(payload, 8, order, delta, shiftFrom)
+	case lcDysymtab:
+		// dysymtab_command: 18 words, offsets at every even index.
+		for i := 0; i+4 <= len(payload) && i <= 64; i += 8 {
+			shiftOffset(payload, i, order, delta, shiftFrom)
+		}
 	case lcSegment, lcSegment64:
-		adjustSegment(cmd, payload, order, delta)
+		adjustSegment(cmd, payload, order, delta, shiftFrom)
 	}
 }
 
-func adjustSegment(cmd uint32, payload []byte, order binary.ByteOrder, delta int32) {
+func adjustSegment(cmd uint32, payload []byte, order binary.ByteOrder, delta int32, shiftFrom uint32) {
 	is64 := cmd == lcSegment64
-	// Segment header: segname[16] + vmaddr/vmsize + fileoff/filesize (+maxprot...)
-	fileoffPos := 24 + 8
+	// Payload layout (cmd+cmdsize already stripped):
+	//   segname[16] vmaddr vmsize fileoff filesize maxprot initprot nsects flags
+	addrSize := 4
 	if is64 {
-		fileoffPos = 24 + 8 + 8 // segname16 + vmaddr8 + vmsize8
-	} else {
-		fileoffPos = 24 + 4 + 4
+		addrSize = 8
+	}
+	fileoffPos := 16 + 2*addrSize
+	nsectsPos := fileoffPos + 2*addrSize + 8 // filesize + maxprot + initprot
+	sectStart := nsectsPos + 8               // nsects + flags
+	sectSize := 68
+	// section offset field: sectname[16] + segname[16] + addr + size
+	offField := 32 + 2*addrSize
+	if is64 {
+		sectSize = 80
 	}
 	if len(payload) < fileoffPos+4 {
 		return
 	}
-	order.PutUint32(payload[fileoffPos:fileoffPos+4], order.Uint32(payload[fileoffPos:fileoffPos+4])+uint32(int64(delta)))
-	// sections
-	nsectsPos := fileoffPos + 12 // fileoff4 + filesize4 + maxprot4
-	nsects := int(order.Uint32(payload[nsectsPos : nsectsPos+4]))
-	sectStart := nsectsPos + 8 // + initprot4 + flags4
-	sectSize := 68
-	if is64 {
-		sectSize = 80
+	if is64 && len(payload) >= fileoffPos+8 {
+		// fileoff is a 64-bit word here; shift the whole thing so that
+		// big-endian images are handled correctly as well.
+		cur := order.Uint64(payload[fileoffPos : fileoffPos+8])
+		if cur >= uint64(shiftFrom) {
+			order.PutUint64(payload[fileoffPos:fileoffPos+8], cur+uint64(int64(delta)))
+		}
+	} else {
+		shiftOffset(payload, fileoffPos, order, delta, shiftFrom)
 	}
+	if nsectsPos+4 > len(payload) {
+		return
+	}
+	nsects := int(order.Uint32(payload[nsectsPos : nsectsPos+4]))
 	for i := 0; i < nsects; i++ {
 		base := sectStart + i*sectSize
-		if base+44 > len(payload) {
+		if base+offField+4 > len(payload) {
 			break
 		}
-		// section offset field: after sectname16+segname16+addr(4or8)+size(4or8)
-		offField := base + 32
-		if is64 {
-			offField = base + 40
-		}
-		if offField+4 <= len(payload) {
-			order.PutUint32(payload[offField:offField+4], order.Uint32(payload[offField:offField+4])+uint32(int64(delta)))
-		}
+		shiftOffset(payload, base+offField, order, delta, shiftFrom)
 	}
 }
 

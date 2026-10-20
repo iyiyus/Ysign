@@ -33,7 +33,10 @@ type algorithmIdentifier struct {
 }
 
 func sha256Alg() algorithmIdentifier {
-	return algorithmIdentifier{Algorithm: oidDigestSHA256, Parameters: asn1.RawValue{Tag: 5}}
+	// Match zsign/OpenSSL output: the SHA-256 digest algorithm carries NO NULL
+	// parameters (Apple's codesign emits it bare). Go's asn1 omits Parameters
+	// when the RawValue is the zero value.
+	return algorithmIdentifier{Algorithm: oidDigestSHA256}
 }
 
 func rsaSHA256Alg() algorithmIdentifier {
@@ -144,7 +147,17 @@ func buildCMS(content []byte, cert *x509.Certificate, chain []*x509.Certificate,
 	}
 
 	// --- Signature over the DER of signedAttrs ---
-	digestAlg, sigAlg, signature, err := signAttributes(signedAttrsDER, priv)
+	// RFC 5652 5.4: when the signedAttrs are present, the value that gets
+	// signed is the DER encoding of the SignedAttributes with the IMPLICIT [0]
+	// tag replaced by the universal SET OF tag (0x31). Hashing the 0xA0-tagged
+	// bytes instead yields a signature every iOS device rejects.
+	toSign := make([]byte, len(signedAttrsDER))
+	copy(toSign, signedAttrsDER)
+	if len(toSign) == 0 || toSign[0] != 0xa0 {
+		return nil, errors.New("cms: unexpected signedAttrs encoding")
+	}
+	toSign[0] = 0x31
+	digestAlg, sigAlg, signature, err := signAttributes(toSign, priv)
 	if err != nil {
 		return nil, err
 	}

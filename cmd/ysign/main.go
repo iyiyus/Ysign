@@ -21,7 +21,13 @@ import (
 type stringList []string
 
 // version is bumped on releases; it is also injected by the build workflow.
-var version = "1.2.1"
+var version = "1.2.3"
+
+// defaultZipLevel is the deflate level used when -z is not given. Repacking a
+// few hundred MB at level 9 costs several seconds and only shaves a few percent
+// off the archive, so the default favours speed; pass -z 9 for the smallest
+// possible ipa.
+const defaultZipLevel = 1
 
 func (s *stringList) String() string { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error {
@@ -31,24 +37,24 @@ func (s *stringList) Set(v string) error {
 
 func main() {
 	var (
-		k                string
-		m                stringList
-		c                string
-		a, f             bool
-		o                string
-		p                string
-		b, n, r, e       string
-		icon             string
-		z                int
-		l, d, w          stringList
-		install          bool
-		t                string
-		sha256Only       bool
-		check            bool
-		metadata         string
-		R, S, E, W, U, P bool
-		M                string
-		q, debug, showV  bool
+		k                   string
+		m                   stringList
+		c                   string
+		a, f                bool
+		o                   string
+		p                   string
+		b, n, r, e          string
+		icon                string
+		z                   int
+		l, d, w             stringList
+		install             bool
+		t                   string
+		sha256Only          bool
+		check               bool
+		metadata            string
+		R, S, E, W, U, P, G bool
+		M                   string
+		q, debug, showV     bool
 	)
 	fs := flag.NewFlagSet("ysign", flag.ExitOnError)
 	fs.StringVar(&k, "k", "", "Path to private key or p12 file")
@@ -75,8 +81,8 @@ func main() {
 	fs.StringVar(&e, "entitlements", "", "New entitlements plist file")
 	fs.StringVar(&icon, "I", "", "New app icon (PNG)")
 	fs.StringVar(&icon, "icon", "", "New app icon (PNG)")
-	fs.IntVar(&z, "z", 9, "Compression level for output ipa (0-9)")
-	fs.IntVar(&z, "zip_level", 9, "Compression level for output ipa (0-9)")
+	fs.IntVar(&z, "z", defaultZipLevel, "Compression level for output ipa (0-9)")
+	fs.IntVar(&z, "zip_level", defaultZipLevel, "Compression level for output ipa (0-9)")
 	fs.Var(&l, "l", "Dylib to inject (repeatable)")
 	fs.Var(&l, "dylib", "Dylib to inject (repeatable)")
 	fs.Var(&d, "D", "Dylib to remove (repeatable)")
@@ -97,6 +103,8 @@ func main() {
 	fs.BoolVar(&R, "rm_provision", false, "Remove provisioning profile after signing")
 	fs.BoolVar(&S, "S", false, "Enable UISupportsDocumentBrowser / UIFileSharingEnabled")
 	fs.BoolVar(&S, "enable_docs", false, "Enable UISupportsDocumentBrowser / UIFileSharingEnabled")
+	fs.BoolVar(&G, "G", false, "Remove UIRequiredDeviceCapabilities from Info.plist")
+	fs.BoolVar(&G, "rm_caps", false, "Remove UIRequiredDeviceCapabilities from Info.plist")
 	fs.StringVar(&M, "M", "", "Set MinimumOSVersion in Info.plist")
 	fs.StringVar(&M, "min_version", "", "Set MinimumOSVersion in Info.plist")
 	fs.BoolVar(&E, "E", false, "Remove all app extensions (PlugIns)")
@@ -132,7 +140,7 @@ Options:
   -r, --bundle_version New bundle version
   -e, --entitlements   New entitlements file
   -I, --icon           New app icon (PNG)
-  -z, --zip_level      Compression level (0-9)
+  -z, --zip_level      Compression level (0-9, default 1: fast)
   -l, --dylib          Dylib to inject (repeatable)
   -D, --rm_dylib       Dylib to remove (repeatable)
   -w, --weak           Inject dylib as weak (repeatable)
@@ -143,6 +151,7 @@ Options:
   -x, --metadata       Extract metadata and icon to directory
   -R, --rm_provision   Remove provisioning profile after signing
   -S, --enable_docs    Enable UISupportsDocumentBrowser / UIFileSharingEnabled
+  -G, --rm_caps        Remove UIRequiredDeviceCapabilities from Info.plist
   -M, --min_version    Set MinimumOSVersion in Info.plist
   -E, --rm_extensions  Remove all app extensions (PlugIns)
   -W, --rm_watch       Remove watch app
@@ -181,7 +190,19 @@ Options:
 
 	// Metadata mode.
 	if metadata != "" {
-		appDir, err := resolveAppDir(input, "")
+		// -x has to work on an .ipa as well, which needs a scratch directory
+		// to unpack into (a .app/folder input is read in place).
+		work := ""
+		if strings.HasSuffix(strings.ToLower(input), ".ipa") {
+			tmp, err := os.MkdirTemp("", "ysign-meta-")
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "metadata:", err)
+				os.Exit(1)
+			}
+			defer os.RemoveAll(tmp)
+			work = tmp
+		}
+		appDir, err := resolveAppDir(input, work)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "metadata:", err)
 			os.Exit(1)
@@ -217,12 +238,6 @@ Options:
 		}
 	}
 
-	cacheDir := t
-	if cacheDir == "" {
-		cd, _ := os.MkdirTemp("", "ysign-cache-")
-		cacheDir = cd
-	}
-
 	workDir, cleanup, err := makeWorkDir(t)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "workdir:", err)
@@ -232,6 +247,23 @@ Options:
 		fmt.Fprintf(os.Stderr, "debug: workdir=%s (kept)\n", workDir)
 	} else {
 		defer cleanup()
+	}
+
+	// The signature cache must never live inside the payload tree: everything
+	// under workDir is zipped into the output ipa. With -t it sits in a
+	// dot-directory that ipautil.ZipDir skips; otherwise it uses one stable
+	// per-user directory so repeated runs actually hit the cache.
+	cacheDir := filepath.Join(workDir, ".ysign-cache")
+	if t == "" {
+		if base, cerr := os.UserCacheDir(); cerr == nil {
+			cacheDir = filepath.Join(base, "ysign")
+		} else {
+			cacheDir = filepath.Join(os.TempDir(), "ysign-cache")
+		}
+	}
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		fmt.Fprintln(os.Stderr, "cache:", err)
+		os.Exit(1)
 	}
 
 	appDir, err := resolveAppDir(input, workDir)
@@ -256,6 +288,7 @@ Options:
 		RemoveExtensions:   E,
 		RemoveWatch:        W,
 		RemoveUISD:         U,
+		RemoveDeviceCaps:   G,
 		RemoveProvision:    R,
 		Signer:             signer,
 		InjectDylibs:       l,
@@ -339,30 +372,46 @@ func resolveAppDir(input, workDir string) (string, error) {
 		}
 		return target, nil
 	default:
-		// A directory containing Payload/xxx.app.
+		// A directory: either an extracted ipa (Payload/xxx.app inside) or a
+		// folder that holds the .app bundle directly.
 		if workDir == "" {
 			return findAppInDir(input)
 		}
+		src := input
+		if st, err := os.Stat(filepath.Join(input, "Payload")); err == nil && st.IsDir() {
+			src = filepath.Join(input, "Payload")
+		}
 		target := filepath.Join(workDir, "Payload")
-		if err := copyDir(input, target); err != nil {
+		if err := copyDir(src, target); err != nil {
 			return "", err
 		}
-		return findAppInDir(target)
+		return findAppInDir(workDir)
 	}
 }
 
 func findAppInDir(dir string) (string, error) {
-	payload := filepath.Join(dir, "Payload")
-	entries, err := os.ReadDir(payload)
+	if app, ok := firstAppUnder(filepath.Join(dir, "Payload")); ok {
+		return app, nil
+	}
+	// Fallback: dir may already be the Payload directory or hold the .app
+	// bundle directly.
+	if app, ok := firstAppUnder(dir); ok {
+		return app, nil
+	}
+	return "", fmt.Errorf("no .app bundle found under %s", dir)
+}
+
+func firstAppUnder(dir string) (string, bool) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return "", fmt.Errorf("no Payload directory in %s: %w", dir, err)
+		return "", false
 	}
 	for _, e := range entries {
 		if e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".app") {
-			return filepath.Join(payload, e.Name()), nil
+			return filepath.Join(dir, e.Name()), true
 		}
 	}
-	return "", fmt.Errorf("no .app bundle under %s", payload)
+	return "", false
 }
 
 func copyDir(src, dst string) error {

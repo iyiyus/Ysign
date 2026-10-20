@@ -1,186 +1,103 @@
 ﻿package signing
 
-// StandardRequirementsBlob is the embedded code requirements (host anchor apple)
-// copied from a working codesign output.
-var StandardRequirementsBlob = []byte{
-  0xFA,
-  0xDE,
-  0x0C,
-  0x01,
-  0x00,
-  0x00,
-  0x00,
-  0xB4,
-  0x00,
-  0x00,
-  0x00,
-  0x01,
-  0x00,
-  0x00,
-  0x00,
-  0x03,
-  0x00,
-  0x00,
-  0x00,
-  0x14,
-  0xFA,
-  0xDE,
-  0x0C,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0xA0,
-  0x00,
-  0x00,
-  0x00,
-  0x01,
-  0x00,
-  0x00,
-  0x00,
-  0x06,
-  0x00,
-  0x00,
-  0x00,
-  0x02,
-  0x00,
-  0x00,
-  0x00,
-  0x10,
-  0x63,
-  0x6F,
-  0x6D,
-  0x2E,
-  0x65,
-  0x78,
-  0x61,
-  0x6D,
-  0x70,
-  0x6C,
-  0x65,
-  0x2E,
-  0x64,
-  0x65,
-  0x6D,
-  0x6F,
-  0x00,
-  0x00,
-  0x00,
-  0x06,
-  0x00,
-  0x00,
-  0x00,
-  0x0F,
-  0x00,
-  0x00,
-  0x00,
-  0x06,
-  0x00,
-  0x00,
-  0x00,
-  0x0B,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x0A,
-  0x73,
-  0x75,
-  0x62,
-  0x6A,
-  0x65,
-  0x63,
-  0x74,
-  0x2E,
-  0x43,
-  0x4E,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x01,
-  0x00,
-  0x00,
-  0x00,
-  0x2E,
-  0x69,
-  0x50,
-  0x68,
-  0x6F,
-  0x6E,
-  0x65,
-  0x20,
-  0x44,
-  0x65,
-  0x76,
-  0x65,
-  0x6C,
-  0x6F,
-  0x70,
-  0x65,
-  0x72,
-  0x3A,
-  0x20,
-  0x43,
-  0x72,
-  0x65,
-  0x61,
-  0x74,
-  0x65,
-  0x64,
-  0x20,
-  0x76,
-  0x69,
-  0x61,
-  0x20,
-  0x41,
-  0x50,
-  0x49,
-  0x20,
-  0x28,
-  0x32,
-  0x34,
-  0x39,
-  0x36,
-  0x35,
-  0x56,
-  0x5A,
-  0x58,
-  0x39,
-  0x33,
-  0x29,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x0E,
-  0x00,
-  0x00,
-  0x00,
-  0x01,
-  0x00,
-  0x00,
-  0x00,
-  0x0A,
-  0x2A,
-  0x86,
-  0x48,
-  0x86,
-  0xF7,
-  0x63,
-  0x64,
-  0x06,
-  0x02,
-  0x01,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
-  0x00,
+import "encoding/binary"
+
+const (
+	csMagicRequirement = 0xfade0c00 // CSMAGIC_REQUIREMENT
+
+	// Requirement expression opcodes, as emitted by Apple's csreq encoder.
+	reqOpIdent              = 0x00000002
+	reqOpAnd                = 0x00000006
+	reqOpCertField          = 0x0000000b
+	reqOpCertGeneric        = 0x0000000e
+	reqOpAppleGenericAnchor = 0x0000000f
+
+	// requirement kind stored in the requirements superblob index.
+	reqKindDesignated = 0x00000003
+)
+
+// reqFieldSubjectCN is the certificate field matched by the designated
+// requirement ("subject.CN"), and reqApplePolicyOID is the Apple signing
+// policy marker OID (1.2.840.113635.100.6.2.1).
+const (
+	reqFieldSubjectCN = "subject.CN"
+	reqApplePolicyOID = "\x2a\x86\x48\x86\xf7\x63\x64\x06\x02\x01"
+)
+
+// BuildRequirementsBlob returns the CSSLOT_REQUIREMENTS blob (a requirements
+// superblob holding one designated requirement) for the given code identifier
+// and signing certificate common name.
+//
+// The encoded expression is:
+//
+//	identifier "<identifier>" and anchor apple generic
+//	  and certificate 0[subject.CN] = "<certCN>"
+//	  and certificate 1[field.1.2.840.113635.100.6.2.1] exists
+//
+// The requirement must be satisfied by the certificate that actually signs the
+// binary, so it can never be a fixed blob: reusing one captured from another
+// identity leaves the designated requirement naming a certificate that is not
+// in the signature, and iOS rejects the code as invalidly signed.
+//
+// When certCN is empty (ad-hoc signing) only the identifier term is emitted.
+func BuildRequirementsBlob(identifier, certCN string) []byte {
+	var expr []byte
+	put32 := func(v uint32) { expr = binary.BigEndian.AppendUint32(expr, v) }
+	putStr := func(s string) {
+		expr = append(expr, s...)
+		if pad := len(s) % 4; pad != 0 {
+			expr = append(expr, make([]byte, 4-pad)...)
+		}
+	}
+
+	put32(0x00000001)
+	put32(reqOpAnd)
+	put32(reqOpIdent)
+	put32(uint32(len(identifier)))
+	putStr(identifier)
+
+	if certCN != "" {
+		put32(reqOpAnd)
+		put32(reqOpAppleGenericAnchor)
+
+		put32(reqOpAnd)
+		put32(reqOpCertField)
+		put32(0) // certificate index 0: the leaf
+		put32(uint32(len(reqFieldSubjectCN)))
+		putStr(reqFieldSubjectCN)
+		put32(0x00000001)
+		put32(uint32(len(certCN)))
+		putStr(certCN)
+
+		put32(reqOpCertGeneric)
+		put32(1) // certificate index 1: the Apple intermediate
+		put32(uint32(len(reqApplePolicyOID)))
+		putStr(reqApplePolicyOID)
+		put32(0)
+	}
+
+	req := make([]byte, 0, 8+len(expr))
+	req = binary.BigEndian.AppendUint32(req, csMagicRequirement)
+	req = binary.BigEndian.AppendUint32(req, uint32(8+len(expr)))
+	req = append(req, expr...)
+
+	// superblob: magic, length, count=1, then one index {kind, offset}.
+	const idxOff = 20
+	out := make([]byte, 0, idxOff+len(req))
+	out = binary.BigEndian.AppendUint32(out, csMagicRequirements)
+	out = binary.BigEndian.AppendUint32(out, uint32(idxOff+len(req)))
+	out = binary.BigEndian.AppendUint32(out, 1)
+	out = binary.BigEndian.AppendUint32(out, reqKindDesignated)
+	out = binary.BigEndian.AppendUint32(out, idxOff)
+	out = append(out, req...)
+	return out
+}
+
+// SignerCommonName returns the subject CN of the signer's certificate, or ""
+// when no signing identity is available (ad-hoc signing).
+func SignerCommonName(s *Signer) string {
+	if s == nil || s.Cert == nil {
+		return ""
+	}
+	return s.Cert.Subject.CommonName
 }

@@ -24,20 +24,25 @@ import (
 
 // Options configures a re-signing run.
 type Options struct {
-	BundleID           string
-	BundleName         string
-	BundleVersion      string
-	MinOSVersion       string
-	EntitlementsFile   string
-	IconFile           string
-	AdHoc              bool
-	Force              bool
-	Quiet              bool
-	CacheDir           string
-	EnableDocs         bool
-	RemoveExtensions   bool
-	RemoveWatch        bool
-	RemoveUISD         bool
+	BundleID         string
+	BundleName       string
+	BundleVersion    string
+	MinOSVersion     string
+	EntitlementsFile string
+	IconFile         string
+	AdHoc            bool
+	Force            bool
+	Quiet            bool
+	CacheDir         string
+	EnableDocs       bool
+	RemoveExtensions bool
+	RemoveWatch      bool
+	RemoveUISD       bool
+	// RemoveDeviceCaps drops UIRequiredDeviceCapabilities from Info.plist.
+	// iOS checks it against the device at install time and rejects the app when
+	// a declared capability is missing, which is a common failure for re-signed
+	// bundles whose capability list came from another device target.
+	RemoveDeviceCaps   bool
 	RemoveProvision    bool
 	Signer             *signing.Signer
 	InjectDylibs       []string
@@ -104,6 +109,9 @@ func Resign(appDir string, opts *Options) error {
 	}
 	if opts.RemoveUISD {
 		plistutil.Set(info, "UISupportedDevices", []interface{}{})
+	}
+	if opts.RemoveDeviceCaps {
+		plistutil.Remove(info, "UIRequiredDeviceCapabilities")
 	}
 
 	// Cleanup before hashing so the signature reflects the final bundle.
@@ -213,6 +221,10 @@ func Resign(appDir string, opts *Options) error {
 	isFileDylib := make(map[string]bool, len(opts.InjectDylibs))
 	if len(opts.InjectDylibs) > 0 {
 		copied := make(map[string]bool)
+		// Dylibs copied into the bundle must be signed too -- an unsigned
+		// dylib fails to load on iOS -- so remember each destination and
+		// append it to the signing list below.
+		var injected []string
 		for _, bin := range binaries {
 			if !injectAllowed(isMainBin(bin)) {
 				continue
@@ -225,11 +237,15 @@ func Resign(appDir string, opts *Options) error {
 							return err
 						}
 						copied[dest] = true
+						if isMachO(dest) {
+							injected = append(injected, dest)
+						}
 					}
 					isFileDylib[d] = true
 				}
 			}
 		}
+		binaries = append(binaries, injected...)
 	}
 
 	// signOne re-signs a single binary in place. Every input it needs is
@@ -283,8 +299,16 @@ func Resign(appDir string, opts *Options) error {
 			if b, err := os.ReadFile(filepath.Join(bdir, "Info.plist")); err == nil {
 				ctx.SpecialInfoPlist = b
 			}
-			if b, err := os.ReadFile(filepath.Join(bdir, "CodeResources")); err == nil {
-				ctx.SpecialCodeResources = b
+			// CodeResources lives inside _CodeSignature/; the legacy
+			// bundle-root location is only a fallback.
+			for _, p := range []string{
+				filepath.Join(bdir, "_CodeSignature", "CodeResources"),
+				filepath.Join(bdir, "CodeResources"),
+			} {
+				if b, err := os.ReadFile(p); err == nil {
+					ctx.SpecialCodeResources = b
+					break
+				}
 			}
 		}
 		out, err := rebuildBinary(data, ctx)
@@ -310,6 +334,29 @@ func Resign(appDir string, opts *Options) error {
 			mainBin = b
 		} else {
 			others = append(others, b)
+		}
+	}
+
+	// Re-seal every nested bundle BEFORE its Mach-O is signed. A nested
+	// bundle's CodeResources excludes the bundle's own executable, so the seal
+	// can be produced up front; the binary's CodeDirectory then seals these
+	// exact bytes through special slot -3. Sealing runs bottom-up because a
+	// bundle's CodeResources is itself part of the enclosing bundle's seal.
+	//
+	// Without this the framework keeps its original seal while its Mach-O is
+	// rewritten, and iOS rejects the install with 0xe8008017 ("a signed
+	// resource has been added, modified, or deleted").
+	for _, b := range nestedBundles(appDir) {
+		data, err := generateCodeResources(b, nestedMainBinary(b), false)
+		if err != nil {
+			return fmt.Errorf("generate CodeResources for %s: %w", filepath.Base(b), err)
+		}
+		dir := filepath.Join(b, "_CodeSignature")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(dir, "CodeResources"), data, 0o644); err != nil {
+			return err
 		}
 	}
 
@@ -379,6 +426,30 @@ func Resign(appDir string, opts *Options) error {
 	}
 	logf(opts, "re-signed %d binary(ies), bundle id=%s team=%s adhoc=%v", len(binaries), bundleID, teamID, opts.AdHoc)
 	return nil
+}
+
+// hashBufSize is the read buffer used when streaming a resource file through
+// the digests; 1 MiB keeps syscall overhead negligible without wasting memory
+// per concurrent worker.
+const hashBufSize = 1 << 20
+
+// hashFileStream computes the SHA-1 and SHA-256 digests of path in a single
+// streaming pass, so large assets never have to fit in memory.
+func hashFileStream(path string) (sha1sum [sha1.Size]byte, sha256sum [sha256.Size]byte, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return sha1sum, sha256sum, err
+	}
+	defer f.Close()
+	h1 := sha1.New()
+	h2 := sha256.New()
+	buf := make([]byte, hashBufSize)
+	if _, err := io.CopyBuffer(io.MultiWriter(h1, h2), f, buf); err != nil {
+		return sha1sum, sha256sum, err
+	}
+	copy(sha1sum[:], h1.Sum(nil))
+	copy(sha256sum[:], h2.Sum(nil))
+	return sha1sum, sha256sum, nil
 }
 
 // parallelFor runs fn(i) for i in [0,n) across a bounded worker pool sized to
@@ -720,6 +791,51 @@ func isMachO(path string) bool {
 // IsMachO exposes the magic check for other packages (e.g. CLI metadata).
 func IsMachO(path string) bool { return isMachO(path) }
 
+// nestedBundles returns every bundle directory inside appDir that contains a
+// Mach-O binary, ordered deepest-first so a bundle is sealed before the bundle
+// enclosing it.
+func nestedBundles(appDir string) []string {
+	var out []string
+	_ = filepath.WalkDir(appDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() || path == appDir {
+			return nil
+		}
+		low := strings.ToLower(d.Name())
+		if !strings.HasSuffix(low, ".framework") && !strings.HasSuffix(low, ".bundle") &&
+			!strings.HasSuffix(low, ".appex") && !strings.HasSuffix(low, ".app") {
+			return nil
+		}
+		if nestedMainBinary(path) == "" {
+			return nil
+		}
+		out = append(out, path)
+		return nil
+	})
+	sort.Slice(out, func(i, j int) bool {
+		return strings.Count(out[i], string(os.PathSeparator)) >
+			strings.Count(out[j], string(os.PathSeparator))
+	})
+	return out
+}
+
+// nestedMainBinary returns the file name of the Mach-O sitting directly inside
+// a bundle directory (the bundle's own executable), or "" when there is none.
+func nestedMainBinary(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		if isMachO(filepath.Join(dir, e.Name())) {
+			return e.Name()
+		}
+	}
+	return ""
+}
+
 // generateCodeResources builds the _CodeSignature/CodeResources XML plist for
 // the given .app bundle, mirroring the layout produced by upstream zsign. It
 // seals the SHA-1/SHA-256 hash of every non-excluded resource file. The caller
@@ -729,7 +845,13 @@ func generateCodeResources(appDir, mainExe string, removeProvision bool) ([]byte
 	// Collect all files (relative, slash-separated), sorted for deterministic output.
 	var files []string
 	if err := filepath.WalkDir(appDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		// Never swallow a walk error: a directory that cannot be listed (too
+		// long a path on Windows, or no permission) would silently drop its
+		// files from the seal, which iOS reports as a modified resource.
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
 			return nil
 		}
 		rel, err := filepath.Rel(appDir, path)
@@ -753,21 +875,40 @@ func generateCodeResources(appDir, mainExe string, removeProvision bool) ([]byte
 		keep = append(keep, f)
 	}
 
-	sha1B64 := func(path string) (string, error) {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return "", err
+	// Hash every sealed resource once: the "files" dict wants SHA-1 and
+	// "files2" wants SHA-1 + SHA-256, so read each file a single time.
+	//
+	// Files are streamed rather than slurped (a multi-GB asset would otherwise
+	// be held entirely in memory) and hashed concurrently: the per-file
+	// digests are independent, so this is the dominant cost for asset-heavy
+	// bundles.
+	type seal struct{ sha1, sha256 string }
+	seals := make(map[string]seal, len(keep))
+	var sealsMu sync.Mutex
+	if err := parallelFor(len(keep), func(i int) error {
+		rel := keep[i]
+		// locversion.plist inside any .lproj is omitted entirely.
+		if strings.HasSuffix(rel, ".lproj/locversion.plist") {
+			return nil
 		}
-		s := sha1.Sum(b)
-		return base64.StdEncoding.EncodeToString(s[:]), nil
-	}
-	sha256B64 := func(path string) (string, error) {
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return "", err
+		if removeProvision && rel == "embedded.mobileprovision" {
+			return nil
 		}
-		s := sha256.Sum256(b)
-		return base64.StdEncoding.EncodeToString(s[:]), nil
+		full := filepath.Join(appDir, filepath.FromSlash(rel))
+		h1, h2, err := hashFileStream(full)
+		if err != nil {
+			return err
+		}
+		s := seal{
+			sha1:   base64.StdEncoding.EncodeToString(h1[:]),
+			sha256: base64.StdEncoding.EncodeToString(h2[:]),
+		}
+		sealsMu.Lock()
+		seals[rel] = s
+		sealsMu.Unlock()
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	var b strings.Builder
@@ -779,94 +920,128 @@ func generateCodeResources(appDir, mainExe string, removeProvision bool) ([]byte
 	<dict>
 `)
 	for _, rel := range keep {
-		full := filepath.Join(appDir, filepath.FromSlash(rel))
-		// locversion.plist inside any .lproj is omitted entirely.
-		if strings.HasSuffix(rel, ".lproj/locversion.plist") {
-			continue
-		}
-		if removeProvision && rel == "embedded.mobileprovision" {
-			continue
-		}
-		h1, err := sha1B64(full)
-		if err != nil {
-			return nil, err
+		s, ok := seals[rel]
+		if !ok {
+			continue // omitted by the rules above
 		}
 		fmt.Fprintf(&b, "\t\t<key>%s</key>\n", xmlEscape(rel))
 		if strings.Contains(rel, ".lproj/") {
 			b.WriteString("\t\t<dict>\n")
-			fmt.Fprintf(&b, "\t\t\t<key>hash</key><data>%s</data>\n", h1)
-			b.WriteString("\t\t\t<key>optional</key><true/>\n")
+			fmt.Fprintf(&b, "\t\t\t<key>hash</key>\n\t\t\t<data>\n\t\t\t%s\n\t\t\t</data>\n", s.sha1)
+			b.WriteString("\t\t\t<key>optional</key>\n\t\t\t<true/>\n")
 			b.WriteString("\t\t</dict>\n")
 		} else {
-			fmt.Fprintf(&b, "\t\t<data>%s</data>\n", h1)
+			fmt.Fprintf(&b, "\t\t<data>\n\t\t%s\n\t\t</data>\n", s.sha1)
 		}
 	}
 	b.WriteString("\t</dict>\n")
 
 	b.WriteString("\t<key>files2</key>\n\t<dict>\n")
 	for _, rel := range keep {
-		full := filepath.Join(appDir, filepath.FromSlash(rel))
-		if strings.HasSuffix(rel, ".lproj/locversion.plist") {
-			continue
-		}
 		// Info.plist, PkgInfo and .DS_Store are sealed only in files (SHA-1), not files2.
 		if rel == "Info.plist" || rel == "PkgInfo" || strings.HasSuffix(rel, ".DS_Store") {
 			continue
 		}
-		if removeProvision && rel == "embedded.mobileprovision" {
-			continue
-		}
-		h1, err := sha1B64(full)
-		if err != nil {
-			return nil, err
-		}
-		h256, err := sha256B64(full)
-		if err != nil {
-			return nil, err
+		s, ok := seals[rel]
+		if !ok {
+			continue // omitted by the rules above
 		}
 		fmt.Fprintf(&b, "\t\t<key>%s</key>\n\t\t<dict>\n", xmlEscape(rel))
-		fmt.Fprintf(&b, "\t\t\t<key>hash</key><data>%s</data>\n", h1)
-		fmt.Fprintf(&b, "\t\t\t<key>hash2</key><data>%s</data>\n", h256)
+		fmt.Fprintf(&b, "\t\t\t<key>hash</key>\n\t\t\t<data>\n\t\t\t%s\n\t\t\t</data>\n", s.sha1)
+		fmt.Fprintf(&b, "\t\t\t<key>hash2</key>\n\t\t\t<data>\n\t\t\t%s\n\t\t\t</data>\n", s.sha256)
 		if strings.Contains(rel, ".lproj/") {
-			b.WriteString("\t\t\t<key>optional</key><true/>\n")
+			b.WriteString("\t\t\t<key>optional</key>\n\t\t\t<true/>\n")
 		}
 		b.WriteString("\t\t</dict>\n")
 	}
 	b.WriteString("\t</dict>\n")
 
-	// Fixed rules / rules2 blocks, identical to upstream zsign output.
+	// Fixed rules / rules2 blocks, byte-identical to Apple codesign output.
 	b.WriteString(`	<key>rules</key>
 	<dict>
-		<key>^.*</key><true/>
+		<key>^.*</key>
+		<true/>
 		<key>^.*\.lproj/</key>
-		<dict><key>optional</key><true/><key>weight</key><real>1000</real></dict>
+		<dict>
+			<key>optional</key>
+			<true/>
+			<key>weight</key>
+			<real>1000</real>
+		</dict>
 		<key>^.*\.lproj/locversion.plist$</key>
-		<dict><key>omit</key><true/><key>weight</key><real>1100</real></dict>
+		<dict>
+			<key>omit</key>
+			<true/>
+			<key>weight</key>
+			<real>1100</real>
+		</dict>
 		<key>^Base\.lproj/</key>
-		<dict><key>weight</key><real>1010</real></dict>
-		<key>^version.plist$</key><true/>
+		<dict>
+			<key>weight</key>
+			<real>1010</real>
+		</dict>
+		<key>^version.plist$</key>
+		<true/>
 	</dict>
 	<key>rules2</key>
 	<dict>
 		<key>.*\.dSYM($|/)</key>
-		<dict><key>weight</key><real>11</real></dict>
+		<dict>
+			<key>weight</key>
+			<real>11</real>
+		</dict>
 		<key>^(.*/)?\.DS_Store$</key>
-		<dict><key>omit</key><true/><key>weight</key><real>2000</real></dict>
-		<key>^.*</key><true/>
+		<dict>
+			<key>omit</key>
+			<true/>
+			<key>weight</key>
+			<real>2000</real>
+		</dict>
+		<key>^.*</key>
+		<true/>
 		<key>^.*\.lproj/</key>
-		<dict><key>optional</key><true/><key>weight</key><real>1000</real></dict>
+		<dict>
+			<key>optional</key>
+			<true/>
+			<key>weight</key>
+			<real>1000</real>
+		</dict>
 		<key>^.*\.lproj/locversion.plist$</key>
-		<dict><key>omit</key><true/><key>weight</key><real>1100</real></dict>
+		<dict>
+			<key>omit</key>
+			<true/>
+			<key>weight</key>
+			<real>1100</real>
+		</dict>
 		<key>^Base\.lproj/</key>
-		<dict><key>weight</key><real>1010</real></dict>
+		<dict>
+			<key>weight</key>
+			<real>1010</real>
+		</dict>
 		<key>^Info\.plist$</key>
-		<dict><key>omit</key><true/><key>weight</key><real>20</real></dict>
+		<dict>
+			<key>omit</key>
+			<true/>
+			<key>weight</key>
+			<real>20</real>
+		</dict>
 		<key>^PkgInfo$</key>
-		<dict><key>omit</key><true/><key>weight</key><real>20</real></dict>
+		<dict>
+			<key>omit</key>
+			<true/>
+			<key>weight</key>
+			<real>20</real>
+		</dict>
 		<key>^embedded\.provisionprofile$</key>
-		<dict><key>weight</key><real>20</real></dict>
+		<dict>
+			<key>weight</key>
+			<real>20</real>
+		</dict>
 		<key>^version\.plist$</key>
-		<dict><key>weight</key><real>20</real></dict>
+		<dict>
+			<key>weight</key>
+			<real>20</real>
+		</dict>
 	</dict>
 </dict>
 </plist>

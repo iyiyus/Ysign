@@ -117,12 +117,14 @@ func OCSPStatus(cert, issuer *x509.Certificate) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create OCSP request: %w", err)
 	}
-	httpResp, err := http.Post(ocspURLs[0], "application/ocsp-request", bytes.NewReader(req))
+	// Bound the request: a slow/unreachable responder must not hang -C.
+	client := &http.Client{Timeout: 10 * time.Second}
+	httpResp, err := client.Post(ocspURLs[0], "application/ocsp-request", bytes.NewReader(req))
 	if err != nil {
 		return "skipped (OCSP responder unreachable)", nil
 	}
 	defer httpResp.Body.Close()
-	body, err := io.ReadAll(httpResp.Body)
+	body, err := io.ReadAll(io.LimitReader(httpResp.Body, 1<<20))
 	if err != nil {
 		return "skipped (cannot read OCSP response)", nil
 	}
@@ -139,7 +141,8 @@ func OCSPStatus(cert, issuer *x509.Certificate) (string, error) {
 	return "unknown (OCSP)", nil
 }
 
-// CheckFile inspects a signing-related file and prints a report. It dispatches// by content type: p12/pem/cer certificates, mobileprovision, ipa, or Mach-O.
+// CheckFile inspects a signing-related file and prints a report. It dispatches
+// by content type: p12/pem/cer certificates, mobileprovision, ipa, or Mach-O.
 func CheckFile(path, p12Password string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -164,12 +167,12 @@ func CheckFile(path, p12Password string) (string, error) {
 		}
 		out := fmt.Sprintf(`MobileProvision: %s
 UUID: %s
-AppID: %s%s
+AppID: %s
 Team: %s
 ProvisionedDevices: %d
 ProvisionsAllDevices: %v
 Expires: %s (%s)`,
-			p.Name, p.UUID, p.AppIdentifier, p.AppIDPrefix(), p.TeamID(),
+			p.Name, p.UUID, p.AppIdentifier, p.TeamID(),
 			len(p.ProvisionedDevices), p.ProvisionsAllDevices,
 			p.ExpirationDate.Format(time.RFC3339), status)
 		if len(p.DeveloperCertificates) > 0 {
