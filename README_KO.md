@@ -145,7 +145,7 @@ Usage: ysign [-options] [-k privkey.pem] [-m dev.prov] [-o output.ipa] file|fold
   -w, --weak            dylib를 weak로 주입(반복 지정 가능)
   -i, --install         서명 후 ideviceinstaller로 설치
   -t, --temp_folder     중간 파일 임시 / 캐시 디렉터리
-  -2, --sha256_only     SHA256 전용 code directory 강제(특수 슬롯 재계산 포함)
+  -2, --sha256_only     SHA256 전용 code directory 강제(특수 슬롯 재계산 포함). SHA-256이 기본값이므로 호환용으로 유지
   -C, --check           인증서 / 프로파일 / 서명 검사(ipa 지원)
   -x, --metadata        메타데이터와 아이콘을 디렉터리로 내보내기
   -R, --rm_provision    서명 후 프로비저닝 프로파일 제거
@@ -216,8 +216,8 @@ ysign -x outdir app.ipa
 ## 캐시
 
 콘텐츠 주소 기반이며 다음 키를 사용합니다:
-- `ph_<sha256(코드 바이트)>` → 코드 페이지 해시
-- `cms_<sha256(CD)>_<인증서 일련번호>` → CMS 서명
+- `ph_<해시 종류>_<sha256(코드 바이트)>` → 코드 페이지 해시
+- `cms_<캐시 버전>_<sha256(CD)>_<인증서 일련번호>` → CMS 서명
 
 캐시 디렉터리는 기본적으로 시스템 임시 디렉터리입니다. `-t`로 지정하고 `-f`로 우회할 수 있습니다. 같은 산출물을 반복해서 재서명할 때 유용합니다.
 

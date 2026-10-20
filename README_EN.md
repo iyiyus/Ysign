@@ -145,7 +145,7 @@ Usage: ysign [-options] [-k privkey.pem] [-m dev.prov] [-o output.ipa] file|fold
   -w, --weak            Inject dylib as weak (repeatable)
   -i, --install         Install via ideviceinstaller after signing
   -t, --temp_folder     Temp folder for intermediate files
-  -2, --sha256_only     Force SHA256-only code directory (incl. special-slot recompute)
+  -2, --sha256_only     Force SHA256-only code directory (incl. special-slot recompute). SHA-256 is the default now; kept for compatibility
   -C, --check           Check certificate / signature (supports ipa)
   -x, --metadata        Extract metadata and icon to directory
   -R, --rm_provision    Remove provisioning profile after signing
@@ -216,8 +216,8 @@ The **main binary** switches to the new bundle id / team and recomputes special 
 ## Cache
 
 Content-addressed, keyed by:
-- `ph_<sha256(code bytes)>` → code page hashes
-- `cms_<sha256(CD)>_<cert serial>` → CMS signature
+- `ph_<hash type>_<sha256(code bytes)>` → code page hashes
+- `cms_<cache version>_<sha256(CD)>_<cert serial>` → CMS signature
 
 The cache directory defaults to the system temp dir; set it with `-t` and bypass it with `-f`. Useful when re-signing the same artifact repeatedly.
 

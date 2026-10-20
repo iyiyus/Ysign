@@ -145,7 +145,7 @@ Usage: ysign [-options] [-k privkey.pem] [-m dev.prov] [-o output.ipa] file|fold
   -w, --weak            dylib を weak として注入（繰り返し指定可）
   -i, --install         署名後に ideviceinstaller でインストール
   -t, --temp_folder     中間ファイルの一時 / キャッシュディレクトリ
-  -2, --sha256_only     SHA256 のみの code directory を強制（特殊スロットも再計算）
+  -2, --sha256_only     SHA256 のみの code directory を強制（特殊スロットも再計算）。SHA-256 は既定値になったため、互換用に残す
   -C, --check           証明書 / プロファイル / 署名を検査（ipa 対応）
   -x, --metadata        メタデータとアイコンをディレクトリへ書き出し
   -R, --rm_provision    署名後にプロビジョニングプロファイルを削除
@@ -216,8 +216,8 @@ ysign -x outdir app.ipa
 ## キャッシュ
 
 コンテンツアドレス方式で、以下のキーを使用：
-- `ph_<sha256(コードバイト)>` → コードページハッシュ
-- `cms_<sha256(CD)>_<証明書シリアル>` → CMS 署名
+- `ph_<ハッシュ種別>_<sha256(コードバイト)>` → コードページハッシュ
+- `cms_<キャッシュバージョン>_<sha256(CD)>_<証明書シリアル>` → CMS 署名
 
 キャッシュディレクトリは既定でシステムの一時ディレクトリ。`-t` で指定、`-f` でバイパスできます。同じ成果物を繰り返し再署名する場合に有効です。
 

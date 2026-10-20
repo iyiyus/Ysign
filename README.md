@@ -145,7 +145,7 @@ ysign -k cert.p12 -p 你的密码 -m dev.mobileprovision -b com.your.app -o sign
   -w, --weak            以 weak 方式注入 dylib（可重复）
   -i, --install         签名后调用 ideviceinstaller 安装
   -t, --temp_folder     临时 / 缓存目录
-  -2, --sha256_only     强制 SHA256-only CodeDirectory（含特殊槽重算）
+  -2, --sha256_only     强制 SHA256-only CodeDirectory（含特殊槽重算）。SHA-256 已是默认值，该标志保留用于兼容旧脚本
   -C, --check           检查证书 / 描述文件 / 签名（支持 ipa）
   -x, --metadata        导出元数据与图标到目录
   -R, --rm_provision    签名后移除描述文件
@@ -216,8 +216,8 @@ ysign -x outdir app.ipa
 ## 缓存
 
 按内容寻址，键设计：
-- `ph_<sha256(代码字节)>` → 代码页哈希
-- `cms_<sha256(CD)>_<证书序列号>` → CMS 签名
+- `ph_<哈希类型>_<sha256(代码字节)>` → 代码页哈希
+- `cms_<缓存版本>_<sha256(CD)>_<证书序列号>` → CMS 签名
 
 缓存目录默认在系统临时目录，可用 `-t` 指定，用 `-f` 强制绕过。适合反复重签同一产物的场景。
 
